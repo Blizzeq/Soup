@@ -123,3 +123,61 @@ def test_tensor_range_is_frozen():
     entry = TensorRange(name="w", dtype="float32", shape=(2,), start=0, end=8)
     with pytest.raises(Exception):
         entry.start = 1
+
+
+class TestReadIntoFillsPreallocatedTensors:
+    def _entry_and_expected(self, tmp_path, name):
+        from safetensors import safe_open
+
+        path = _mixed_shard(tmp_path)
+        with safe_open(path, framework="pt") as handle:
+            expected = handle.get_tensor(name).clone()
+        return path, read_header(path)[name], expected
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "self_attn.q_proj.weight",
+            "self_attn.q_proj.weight::absmax",
+            "input_layernorm.weight",
+        ],
+    )
+    def test_bytes_match_safetensors_for_every_dtype(self, tmp_path, name):
+        from soup_cli.utils.safetensors_reader import read_into
+
+        path, entry, expected = self._entry_and_expected(tmp_path, name)
+        dst = torch.empty(entry.shape, dtype=getattr(torch, entry.dtype), device="cpu")
+        with open(path, "rb") as handle:
+            read_into(handle, entry, dst)
+        assert dst.dtype == expected.dtype
+        assert torch.equal(dst.view(torch.uint8), expected.view(torch.uint8))
+
+    def test_a_tensor_of_the_wrong_size_is_refused(self, tmp_path):
+        from soup_cli.utils.safetensors_reader import read_into
+
+        path, entry, _ = self._entry_and_expected(tmp_path, "input_layernorm.weight")
+        dst = torch.empty((entry.shape[0] + 1,), dtype=torch.bfloat16)
+        with open(path, "rb") as handle:
+            with pytest.raises(ValueError, match="destination holds"):
+                read_into(handle, entry, dst)
+
+    def test_a_non_contiguous_destination_is_refused(self, tmp_path):
+        from soup_cli.utils.safetensors_reader import read_into
+
+        path, entry, _ = self._entry_and_expected(tmp_path, "self_attn.q_proj.weight")
+        dst = torch.empty((entry.shape[0], entry.shape[1] * 2), dtype=torch.uint8)[:, ::2]
+        assert not dst.is_contiguous()
+        with open(path, "rb") as handle:
+            with pytest.raises(ValueError, match="contiguous"):
+                read_into(handle, entry, dst)
+
+    def test_a_truncated_file_raises_rather_than_leaving_stale_bytes(self, tmp_path):
+        from soup_cli.utils.safetensors_reader import read_into
+
+        path, entry, _ = self._entry_and_expected(tmp_path, "self_attn.q_proj.weight")
+        truncated = tmp_path / "cut.safetensors"
+        truncated.write_bytes(Path(path).read_bytes()[: entry.start + 8])
+        dst = torch.empty(entry.shape, dtype=torch.uint8)
+        with open(truncated, "rb") as handle:
+            with pytest.raises(OSError, match="short read"):
+                read_into(handle, entry, dst)

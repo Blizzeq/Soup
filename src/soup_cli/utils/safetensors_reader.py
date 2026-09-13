@@ -136,3 +136,38 @@ def read_header(path: str) -> Dict[str, TensorRange]:
             name=name, dtype=dtype, shape=shape, start=start, end=end
         )
     return entries
+
+
+def read_into(handle: "object", entry: TensorRange, tensor: "object") -> None:
+    """Fill ``tensor`` from ``handle`` at ``entry``'s byte range.
+
+    ``tensor`` is a pre-allocated CPU tensor of the right shape and dtype —
+    allocating here would defeat the pool. The read goes through a ``uint8``
+    view of the SAME memory, because ``numpy()`` refuses bfloat16 and a
+    ``frombuffer`` round trip would copy.
+    """
+    import torch
+
+    if not tensor.is_contiguous():
+        raise ValueError(
+            f"tensor {entry.name!r}: destination must be contiguous to be read into"
+        )
+    if tensor.device.type != "cpu":
+        raise ValueError(
+            f"tensor {entry.name!r}: destination must live on the CPU, "
+            f"got {tensor.device}"
+        )
+    held = tensor.numel() * tensor.element_size()
+    if held != entry.nbytes:
+        raise ValueError(
+            f"tensor {entry.name!r}: shard holds {entry.nbytes} bytes but the "
+            f"destination holds {held}"
+        )
+    flat = tensor.view(torch.uint8).reshape(-1)
+    handle.seek(entry.start)
+    got = handle.readinto(memoryview(flat.numpy()))
+    if got != entry.nbytes:
+        raise OSError(
+            f"tensor {entry.name!r}: short read, {got} of {entry.nbytes} bytes "
+            f"at offset {entry.start}"
+        )
