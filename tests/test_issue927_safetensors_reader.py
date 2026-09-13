@@ -171,13 +171,42 @@ class TestReadIntoFillsPreallocatedTensors:
             with pytest.raises(ValueError, match="contiguous"):
                 read_into(handle, entry, dst)
 
-    def test_a_truncated_file_raises_rather_than_leaving_stale_bytes(self, tmp_path):
+    def test_a_non_cpu_destination_is_refused(self, tmp_path):
+        """Pins the CPU-device guard. ``device="meta"`` needs no GPU: a meta
+        tensor carries real shape/stride/device metadata with no storage, so
+        the contiguity check ahead of it still passes and the device check is
+        what actually fires."""
         from soup_cli.utils.safetensors_reader import read_into
 
         path, entry, _ = self._entry_and_expected(tmp_path, "self_attn.q_proj.weight")
+        dst = torch.empty(entry.shape, dtype=torch.uint8, device="meta")
+        assert dst.is_contiguous()
+        with open(path, "rb") as handle:
+            with pytest.raises(ValueError, match="must live on the CPU, got meta"):
+                read_into(handle, entry, dst)
+
+    def test_a_truncated_file_raises_and_leaves_the_destination_partially_filled(
+        self, tmp_path
+    ):
+        """read_into's failure contract: the destination is left undefined,
+        not rolled back or zeroed. A short read writes whatever prefix bytes
+        DID arrive and leaves the rest exactly as the caller left it — pinned
+        here with a sentinel (not zero) so the assertion cannot pass by
+        coincidence with an already-zeroed buffer."""
+        from soup_cli.utils.safetensors_reader import read_into
+
+        path, entry, _ = self._entry_and_expected(tmp_path, "self_attn.q_proj.weight")
+        on_disk = Path(path).read_bytes()
+        surviving_bytes = 8
         truncated = tmp_path / "cut.safetensors"
-        truncated.write_bytes(Path(path).read_bytes()[: entry.start + 8])
-        dst = torch.empty(entry.shape, dtype=torch.uint8)
+        truncated.write_bytes(on_disk[: entry.start + surviving_bytes])
+        sentinel = 0xAB
+        dst = torch.full(entry.shape, sentinel, dtype=torch.uint8)
         with open(truncated, "rb") as handle:
             with pytest.raises(OSError, match="short read"):
                 read_into(handle, entry, dst)
+        flat = dst.view(torch.uint8).reshape(-1)
+        written_prefix = on_disk[entry.start : entry.start + surviving_bytes]
+        assert bytes(flat[:surviving_bytes].numpy()) == written_prefix
+        untouched_tail = flat[surviving_bytes:]
+        assert torch.equal(untouched_tail, torch.full_like(untouched_tail, sentinel))

@@ -145,6 +145,10 @@ def read_into(handle: "object", entry: TensorRange, tensor: "object") -> None:
     allocating here would defeat the pool. The read goes through a ``uint8``
     view of the SAME memory, because ``numpy()`` refuses bfloat16 and a
     ``frombuffer`` round trip would copy.
+
+    If this raises, ``tensor`` holds undefined contents — a short read leaves
+    whatever prefix bytes arrived and does not zero or roll back the rest —
+    and must not be used until a later call fills it successfully.
     """
     import torch
 
