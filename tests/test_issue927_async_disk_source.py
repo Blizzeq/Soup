@@ -471,3 +471,166 @@ class TestTheShapeBuildSourceActuallyPasses:
             assert source.disk_bytes == 2 * (8 * 4 * 4) + 64 * 4 * 4
         finally:
             source.close()
+
+
+# ==========================================================================
+# read_ahead must actually read ahead
+# ==========================================================================
+def _settle(source, timeout: float = 10.0) -> None:
+    """Wait until the reader has nothing queued and nothing in flight.
+
+    Depth is a property of the pipeline at rest. Sampling while the reader is
+    mid-read would measure this machine's timing, not the source's design.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not source._queue and source._in_flight is None:
+            return
+        time.sleep(0.002)
+    raise AssertionError("the reader never went idle")
+
+
+def _deep_shards(tmp_path: Path, n_layers: int) -> str:
+    from soup_cli.utils.layer_shard import layer_shard_path
+
+    out = tmp_path / "deep"
+    out.mkdir()
+    for idx in range(n_layers):
+        save_file(
+            {"w": torch.full((256,), idx % 251, dtype=torch.uint8)},
+            layer_shard_path(str(out), idx),
+        )
+    return str(out)
+
+
+class TestReadAheadActuallyReadsAhead:
+    """``read_ahead`` is a DEPTH, and depth has to be measured, not declared.
+
+    The parent commit armed exactly one target — ``idx + direction`` — so the
+    reader was at most ONE layer ahead of the consumer whatever the setting
+    said, and ``read_ahead=8`` charged eight layers of pinned host memory for a
+    one-deep pipeline. Every test in this file passed. That is what makes a
+    setting that does not do what it says invisible (#748), and it matters most
+    exactly where this source is used: on a cold disk the read is roughly 12x
+    the compute, so one layer of lookahead can only hide one layer's read.
+
+    The reachable depth is ``read_ahead - 1``, not ``read_ahead``: one slot is
+    always the one the consumer is holding.
+    """
+
+    N_LAYERS = 16
+
+    @pytest.mark.parametrize("read_ahead", [1, 2, 4, 8])
+    def test_forward_depth_scales_with_the_setting(self, tmp_path, read_ahead):
+        shard_dir = _deep_shards(tmp_path, self.N_LAYERS)
+        spec = RamSource.layer_specs_from_shards(shard_dir, self.N_LAYERS)
+        source = AsyncDiskSource(
+            shard_dir, self.N_LAYERS, spec, read_ahead=read_ahead, pin=False
+        )
+        try:
+            deepest = 0
+            for idx in range(self.N_LAYERS - read_ahead):
+                source.get(idx, "w")
+                _settle(source)
+                ahead = sum(1 for layer in source._slot_of if layer > idx)
+                deepest = max(deepest, ahead)
+            assert deepest == read_ahead - 1, (
+                f"read_ahead={read_ahead} staged at most {deepest} layers ahead of "
+                f"demand, expected {read_ahead - 1}. The setting charges "
+                f"{read_ahead} layers of host memory for the depth it promises."
+            )
+        finally:
+            source.close()
+
+    def test_depth_is_a_window_that_slides_not_a_one_off_burst(self, tmp_path):
+        """Depth has to be SUSTAINED, or the pipeline drains after one step."""
+        shard_dir = _deep_shards(tmp_path, self.N_LAYERS)
+        spec = RamSource.layer_specs_from_shards(shard_dir, self.N_LAYERS)
+        source = AsyncDiskSource(shard_dir, self.N_LAYERS, spec, read_ahead=4, pin=False)
+        try:
+            for idx in range(self.N_LAYERS - 4):
+                source.get(idx, "w")
+                _settle(source)
+                staged = sorted(layer for layer in source._slot_of if layer > idx)
+                assert staged == [idx + 1, idx + 2, idx + 3], (
+                    f"at layer {idx} the lookahead window was {staged}, not the "
+                    f"three consecutive layers the consumer is about to ask for"
+                )
+        finally:
+            source.close()
+
+
+class TestTheDirectionIsFollowedNotAssumed:
+    """The direction half had no test: reverting ``_note_direction`` to
+    always-forward passed all 21. On the backward recompute an always-forward
+    plan targets layers the consumer has just been through, which are still
+    resident, so it queues nothing and the pipeline runs dry exactly half the
+    time.
+    """
+
+    N_LAYERS = 16
+
+    def test_the_backward_walk_is_prefetched_as_deeply_as_the_forward_one(
+        self, tmp_path
+    ):
+        shard_dir = _deep_shards(tmp_path, self.N_LAYERS)
+        spec = RamSource.layer_specs_from_shards(shard_dir, self.N_LAYERS)
+        source = AsyncDiskSource(shard_dir, self.N_LAYERS, spec, read_ahead=4, pin=False)
+        try:
+            deepest = 0
+            for idx in range(self.N_LAYERS - 1, 3, -1):
+                source.get(idx, "w")
+                _settle(source)
+                behind = sum(1 for layer in source._slot_of if layer < idx)
+                deepest = max(deepest, behind)
+            assert deepest == 3, (
+                f"walking DOWN, the deepest lookahead was {deepest} layers, expected "
+                f"3. The reader is prefetching in the direction the consumer came "
+                f"from, not the one it is going."
+            )
+        finally:
+            source.close()
+
+    def test_every_backward_target_is_staged_before_it_is_asked_for(self, tmp_path):
+        """The reviewer's shape: after get(idx) on the way down, is idx-1 there?"""
+        shard_dir = _deep_shards(tmp_path, 8)
+        spec = RamSource.layer_specs_from_shards(shard_dir, 8)
+        source = AsyncDiskSource(shard_dir, 8, spec, read_ahead=2, pin=False)
+        try:
+            for idx in range(8):
+                source.get(idx, "w")
+            missed = []
+            for idx in range(7, 0, -1):
+                source.get(idx, "w")
+                _settle(source)
+                if (idx - 1) not in source._slot_of:
+                    missed.append(idx - 1)
+            assert not missed, (
+                f"layers {missed} were not staged before the backward walk reached "
+                f"them — each one is a read the consumer had to wait on"
+            )
+        finally:
+            source.close()
+
+
+class TestPinningRefusesPageableMemory:
+    """The mirror of RamSource's guard (tests/test_qwen35_streaming.py) — the
+    branch existed with no test, so a box quietly handing back pageable memory
+    would have reported the fast path while paying the ~97% -> ~79% cost.
+    """
+
+    def test_a_pageable_allocation_is_refused_not_reported_as_pinned(
+        self, tmp_path, monkeypatch
+    ):
+        shard_dir = _shards(tmp_path)
+        spec = _spec(shard_dir)
+        real_empty = torch.empty
+
+        def _pageable_empty(*args, **kwargs):
+            allocation = dict(kwargs)
+            allocation["pin_memory"] = False
+            return real_empty(*args, **allocation)
+
+        monkeypatch.setattr(torch, "empty", _pageable_empty)
+        with pytest.raises(RuntimeError, match="returned pageable memory"):
+            AsyncDiskSource(shard_dir, N_LAYERS, spec, pin=True)

@@ -182,7 +182,13 @@ class AsyncDiskSource:
 
         self._lock = threading.Lock()
         self._ready = threading.Condition(self._lock)
-        self._wanted: Optional[int] = 0
+        # The reader works a QUEUE, not a single request: with one pending
+        # target it can only ever be ONE layer ahead of the consumer, so
+        # `read_ahead=8` charged eight layers of pinned host memory for a
+        # one-deep pipeline. On the cold-disk regime this source exists for,
+        # the read is ~12x the compute, and one layer of lookahead can only
+        # hide one layer's read behind one layer's compute.
+        self._queue: List[int] = [0]
         self._slot_of: Dict[int, int] = {}
         self._in_flight: Optional[int] = None
         self._next_slot: List[int] = [0] * len(self._group_slots)
@@ -250,17 +256,52 @@ class AsyncDiskSource:
         if freed:
             self._ready.notify_all()
 
+    def _plan_queue(self, idx: int) -> List[int]:
+        """The upcoming layers worth staging, deepest-first order. Lock held.
+
+        Walks ``read_ahead - 1`` steps in the consumer's CURRENT direction —
+        one slot in ``idx``'s own group is spoken for by ``idx`` itself, so the
+        rest is what genuine lookahead can occupy. The budget is per spec
+        group and per real slot, not a flat count, for two reasons: a target
+        whose group has no free slot could never be claimed and would only
+        block the queue behind it, and the vocabulary group holds one member,
+        so it can absorb exactly one target no matter how deep the decoder
+        runs.
+
+        At ``read_ahead=1`` the home budget is zero and the plan is empty,
+        which is the same "no arming with a single slot" the explicit guard
+        used to spell out: the only slot is the one being handed back.
+
+        Already-resident layers consume budget (they are occupying a slot) but
+        are not re-queued.
+        """
+        budget = [len(slots) for slots in self._group_slots]
+        budget[self._group_of[idx]] -= 1
+        plan: List[int] = []
+        nxt = idx + self._direction
+        for _ in range(self.read_ahead):
+            if not 0 <= nxt < self.n_layers:
+                break
+            group = self._group_of[nxt]
+            if budget[group] <= 0:
+                break
+            budget[group] -= 1
+            if nxt not in self._slot_of:
+                plan.append(nxt)
+            nxt += self._direction
+        return plan
+
     def _run(self) -> None:
         try:
             while True:
                 with self._ready:
-                    while self._wanted is None and not self._closed:
+                    while not self._queue and not self._closed:
                         self._ready.wait()
                     if self._closed:
                         return
-                    idx = self._wanted
-                    self._wanted = None
+                    idx = self._queue[0]
                     if idx in self._slot_of:
+                        self._queue.pop(0)
                         continue
                     claimed = self._claim_slot(idx)
                     if claimed is None:
@@ -269,10 +310,12 @@ class AsyncDiskSource:
                         # is overwriting a buffer the consumer is reading, which
                         # is the whole defect. If no release ever comes, `get`
                         # surfaces it as its own loud timeout rather than a
-                        # silently wrong weight reaching the device.
-                        self._wanted = idx
+                        # silently wrong weight reaching the device. The target
+                        # stays at the FRONT of the queue: it is still the next
+                        # thing wanted, it just has nowhere to land yet.
                         self._ready.wait(timeout=1.0)
                         continue
+                    self._queue.pop(0)
                     slot_index = claimed
                     draining = self._drain[slot_index]
                     self._drain[slot_index] = None
@@ -356,20 +399,13 @@ class AsyncDiskSource:
                     # the reader to overwrite it.
                     self._hold(idx)
                     self._note_direction(idx)
-                    nxt = idx + self._direction
-                    # Arming the next read only buys overlap with a SPARE slot.
-                    # At depth 1 the only slot is the one being handed back, so
-                    # the reader would claim nothing and wait for its release —
-                    # pure overhead. (Before the live-slot rule below, it did
-                    # something worse: it armed the reader to overwrite the very
-                    # buffer this call was returning, which is how a read_ahead=1
-                    # source handed back another layer's bytes.)
-                    if (
-                        self.read_ahead > 1
-                        and 0 <= nxt < self.n_layers
-                        and nxt not in self._slot_of
-                    ):
-                        self._wanted = nxt
+                    # Re-plan on every hit rather than arming one target. The
+                    # plan is recomputed from the CURRENT direction, so the
+                    # backward pass discards a forward queue at the turnaround
+                    # instead of spending the whole recompute fetching layers
+                    # the consumer has already gone past.
+                    self._queue = self._plan_queue(idx)
+                    if self._queue:
                         self._ready.notify_all()
                     return tensor
                 # Asking for a layer that is not resident ends any implicit hold
@@ -377,8 +413,14 @@ class AsyncDiskSource:
                 # is what keeps a release-unaware consumer from deadlocking a
                 # reader that now refuses to overwrite a live slot.
                 self._hold(idx)
-                if self._in_flight != idx and self._wanted != idx:
-                    self._wanted = idx
+                if self._in_flight != idx and (
+                    not self._queue or self._queue[0] != idx
+                ):
+                    # Demand goes to the FRONT: a blocked consumer outranks any
+                    # lookahead, including one this same walk planned. The rest
+                    # of the queue is dropped — wanting a layer the plan did not
+                    # have is the plan being wrong, not a reason to finish it.
+                    self._queue = [idx]
                     self._ready.notify_all()
                 self._ready.wait(timeout=30.0)
                 if (
@@ -386,7 +428,7 @@ class AsyncDiskSource:
                     and not self._closed
                     and idx not in self._slot_of
                     and self._in_flight != idx
-                    and self._wanted != idx
+                    and idx not in self._queue
                 ):
                     raise RuntimeError(
                         f"layer-stream reader made no progress on layer {idx} for "
