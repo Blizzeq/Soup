@@ -143,6 +143,16 @@ class AsyncDiskSource:
             members[group] += 1
             self._group_of.append(group)
 
+        # The index span each group's walk lives in. The decoder layers are one
+        # contiguous run; each vocabulary weight is a group of one, where there
+        # is no walk to speak of.
+        self._group_bounds: List[Tuple[int, int]] = []
+        for group in range(len(groups)):
+            indices = [
+                idx for idx in range(self.n_layers) if self._group_of[idx] == group
+            ]
+            self._group_bounds.append((min(indices), max(indices)))
+
         self._slots: List[Dict[str, Any]] = []
         self._group_slots: List[List[int]] = []
         self.nbytes = 0
@@ -196,8 +206,22 @@ class AsyncDiskSource:
         # the event that says when its copy has drained.
         self._live: List[bool] = [False] * len(self._slots)
         self._drain: List[Any] = [None] * len(self._slots)
-        self._last_get: Optional[int] = None
-        self._direction = 1
+        # Anchor and direction are PER SPEC GROUP. A single shared anchor was
+        # poisoned by the very first `get` of a real run: `install_streaming`
+        # primes the output weight BEFORE the decoder walk, so the first index
+        # ever seen was the embed's — in its own group, above every decoder
+        # layer. The old cross-group guard then made every later decoder `get`
+        # return early, and the anchor never moved again for the rest of the
+        # run. Measured on a hetero source over a full forward AND backward:
+        # `_last_get` stuck at the embed index and `_direction` stuck at +1,
+        # with `_still_wanted` true 0 times out of 16 — the eviction preference
+        # degenerating to the plain FIFO it exists to replace, and the backward
+        # pass prefetching the wrong way from end to end.
+        #
+        # Per-group state removes the guard rather than strengthening it: a
+        # group that keeps its own anchor cannot be spoken for by another.
+        self._last_get: Dict[int, int] = {}
+        self._direction: Dict[int, int] = {}
         self._error: Optional[BaseException] = None
         self._closed = False
         self._thread = threading.Thread(
@@ -206,19 +230,37 @@ class AsyncDiskSource:
         self._thread.start()
 
     # -- the reader ------------------------------------------------------
-    def _still_wanted(self, layer: int) -> bool:
-        """Is ``layer`` still inside the lookahead window the walk is heading into?
+    def _window_span(self, group: int) -> int:
+        """How many of ``group``'s layers its staging can hold at once.
 
-        The window is ``read_ahead`` layers starting at the consumer's current
-        position and running in its current direction — exactly what
-        ``_plan_queue`` populates. A layer behind the walk, or beyond the far
-        edge, has already been used or is not wanted yet.
+        THE one width, read by both the producer of the window and its
+        defender. ``_plan_queue`` spends this as a per-group budget and
+        ``_still_wanted`` compares against it; before they shared it, a group
+        with fewer slots than ``read_ahead`` (a short model, or a vocabulary
+        weight, which is a group of one) had an evictor defending a wider
+        window than the planner could ever fill.
         """
-        anchor = self._last_get
+        return len(self._group_slots[group])
+
+    def _still_wanted(self, layer: int) -> bool:
+        """Is ``layer`` still inside the lookahead window its walk is heading into?
+
+        Anchored on ``layer``'s OWN group, which is what ``_plan_queue`` walks
+        from. Reading a shared anchor here is what made this predicate answer
+        about the decoder walk using the embed's index, and say False every
+        time. A layer behind the walk, or beyond the far edge, has already been
+        used or is not wanted yet.
+
+        ``k = 0`` counts as wanted where ``_plan_queue`` starts at ``k = 1``:
+        the layer the consumer is standing on is the one thing that must not be
+        evicted, and is also the one thing there is no point fetching.
+        """
+        group = self._group_of[layer]
+        anchor = self._last_get.get(group)
         if anchor is None:
             return False
-        step = (layer - anchor) * self._direction
-        return 0 <= step < self.read_ahead
+        step = (layer - anchor) * self._direction.get(group, 1)
+        return 0 <= step < self._window_span(group)
 
     def _claim_slot(self, idx: int) -> Optional[int]:
         """Choose a staging slot to refill with layer ``idx``. Lock held.
@@ -314,10 +356,11 @@ class AsyncDiskSource:
         Already-resident layers consume budget (they are occupying a slot) but
         are not re-queued.
         """
-        budget = [len(slots) for slots in self._group_slots]
+        budget = [self._window_span(group) for group in range(len(self._group_slots))]
         budget[self._group_of[idx]] -= 1
         plan: List[int] = []
-        nxt = idx + self._direction
+        direction = self._direction.get(self._group_of[idx], 1)
+        nxt = idx + direction
         for _ in range(self.read_ahead):
             if not 0 <= nxt < self.n_layers:
                 break
@@ -327,7 +370,7 @@ class AsyncDiskSource:
             budget[group] -= 1
             if nxt not in self._slot_of:
                 plan.append(nxt)
-            nxt += self._direction
+            nxt += direction
         return plan
 
     def _run(self) -> None:
@@ -386,7 +429,7 @@ class AsyncDiskSource:
             self._ready.notify_all()
 
     def _note_direction(self, idx: int) -> None:
-        """Track which way the consumer is walking the stack. Lock held.
+        """Track which way the consumer is walking ``idx``'s group. Lock held.
 
         ``StreamPrefetcher`` walks 0..L-1 on the forward pass and L-1..0 on the
         backward recompute, so arming ``idx + 1`` unconditionally spent the
@@ -394,19 +437,29 @@ class AsyncDiskSource:
         wasted I/O that also evicted a slot the next ``get`` wanted. A repeat of
         the same index carries no direction information and leaves it alone.
 
-        A fetch from a DIFFERENT spec group is not a step along this walk: the
-        tail prefetch of ``model.embed_tokens.weight`` sits at an index above
-        every decoder layer, so letting it speak would read as a forward step at
-        exactly the turnaround where the direction has just flipped. It is
-        ignored entirely — including for ``_last_get``, so the decoder step
-        after it still compares against the last decoder step.
+        Each group is tracked separately, so a vocabulary fetch simply updates
+        the vocabulary group and says nothing about the decoder walk. That is
+        what makes the three orderings that actually occur harmless: the
+        ``_prime`` output weight before the decoder walk, the tail prefetch at
+        the forward turnaround, and the step wrap — none of them writes the
+        decoder group's anchor, because none of them is a decoder index.
+
+        The edge rule is the other half. A walk that has reached the end of its
+        group's span can only continue the other way, and the index it arrives
+        on is often a REPEAT (``prime()`` re-reads layer 0; the backward pass
+        re-reads the last forward layer), which carries no direction of its own.
+        Without this the first layer after every turnaround and every step
+        boundary is demanded before it is staged. A group of one has no walk, so
+        it is left alone.
         """
-        last = self._last_get
-        if last is not None and self._group_of[idx] != self._group_of[last]:
-            return
-        self._last_get = idx
+        group = self._group_of[idx]
+        last = self._last_get.get(group)
+        self._last_get[group] = idx
         if last is not None and idx != last:
-            self._direction = 1 if idx > last else -1
+            self._direction[group] = 1 if idx > last else -1
+        low, high = self._group_bounds[group]
+        if low < high and not low <= idx + self._direction.get(group, 1) <= high:
+            self._direction[group] = -self._direction.get(group, 1)
 
     # -- the interface ---------------------------------------------------
     def get(self, idx: int, name: str):

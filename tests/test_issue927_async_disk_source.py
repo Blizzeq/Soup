@@ -734,3 +734,142 @@ class TestDepthSurvivesTheTurnaround:
             )
         finally:
             source.close()
+
+
+class TestDepthOnTheShapeProductionActuallyHas:
+    """Every depth test above uses ONE spec group. A real model has three.
+
+    ``install_streaming._prime`` calls ``large_pool.load_async(embed_key, ...)``
+    BEFORE ``prefetcher.prime()``, so the first ``source.get`` of a run is the
+    embed -- its own spec group, at an index above every decoder layer. With a
+    single shared anchor that first call set it forever: every later decoder
+    ``get`` took the cross-group early return, ``_direction`` stuck at +1 through
+    the whole backward pass, and the eviction preference degenerated to the
+    plain FIFO it exists to replace. Measured on this shape before the per-group
+    anchor: backward sustained depth 0 at read_ahead 4 AND 8, with 50 of 58 and
+    34 of 50 layers demanded before they were staged.
+
+    Homogeneous tests cannot see any of it, which is the point of this class.
+    """
+
+    N_DECODER = 20
+    STEPS = 2
+
+    @staticmethod
+    def _hetero_fixture(tmp_path: Path, n_decoder: int):
+        """Decoder shards plus embed and lm_head, as ``_build_source`` builds it."""
+        from soup_cli.utils.layer_shard import layer_shard_path
+
+        out = tmp_path / "production"
+        out.mkdir()
+        for idx in range(n_decoder):
+            save_file(
+                {"w": torch.full((256,), idx % 251, dtype=torch.uint8)},
+                layer_shard_path(str(out), idx),
+            )
+        large = [
+            (n_decoder, "model.embed_tokens.weight"),
+            (n_decoder + 1, "lm_head.weight"),
+        ]
+        specs = [{"w": ((256,), "uint8")} for _ in range(n_decoder)]
+        paths = [layer_shard_path(str(out), idx) for idx in range(n_decoder)]
+        for index, key in large:
+            path = out / f"large_{index}.safetensors"
+            save_file({key: torch.full((1024,), 7, dtype=torch.uint8)}, str(path))
+            specs.append({key: ((1024,), "uint8")})
+            paths.append(str(path))
+        return str(out), specs, paths, large
+
+    @pytest.mark.parametrize("read_ahead", [2, 4, 8])
+    def test_both_passes_keep_full_depth_with_the_embed_primed_first(
+        self, tmp_path, read_ahead
+    ):
+        decoders = self.N_DECODER
+        shard_dir, specs, paths, large = self._hetero_fixture(tmp_path, decoders)
+        (embed_idx, embed_key), (head_idx, head_key) = large
+        source = AsyncDiskSource(
+            shard_dir,
+            decoders + 2,
+            specs,
+            shard_paths=paths,
+            read_ahead=read_ahead,
+            pin=False,
+        )
+        try:
+            forward, backward = [], []
+            missed_forward, missed_backward = 0, 0
+            for step in range(self.STEPS):
+                # install_streaming._prime: the OUTPUT weight, before the walk.
+                source.get(embed_idx, embed_key)
+                source.release(embed_idx, None)
+                for idx in range(decoders):
+                    staged = idx in source._slot_of
+                    source.get(idx, "w")
+                    source.release(idx, None)
+                    _settle(source)
+                    if step >= 1 and idx + read_ahead - 1 < decoders:
+                        forward.append(
+                            sum(1 for lay in source._slot_of if idx < lay < decoders)
+                        )
+                        if not staged:
+                            missed_forward += 1
+                # StreamPrefetcher's tail prefetch at the forward turnaround.
+                source.get(head_idx, head_key)
+                source.release(head_idx, None)
+                for idx in range(decoders - 1, -1, -1):
+                    staged = idx in source._slot_of
+                    source.get(idx, "w")
+                    source.release(idx, None)
+                    _settle(source)
+                    if step >= 1 and idx >= read_ahead - 1:
+                        backward.append(sum(1 for lay in source._slot_of if lay < idx))
+                        if not staged:
+                            missed_backward += 1
+            assert min(forward) == read_ahead - 1, (
+                f"forward pass sustained {min(forward)} of {read_ahead - 1} on the "
+                f"production shape"
+            )
+            assert min(backward) == read_ahead - 1, (
+                f"BACKWARD pass sustained {min(backward)} of {read_ahead - 1} on the "
+                f"production shape. A cross-group fetch has frozen the decoder walk's "
+                f"direction, so the recompute is prefetching the way it came."
+            )
+            assert (missed_forward, missed_backward) == (0, 0), (
+                f"{missed_forward} forward and {missed_backward} backward layers were "
+                f"demanded before they were staged"
+            )
+        finally:
+            source.close()
+
+    def test_a_vocabulary_fetch_never_speaks_for_the_decoder_walk(self, tmp_path):
+        """The mechanism, named: the anchor the eviction policy reads."""
+        decoders = 8
+        shard_dir, specs, paths, large = self._hetero_fixture(tmp_path, decoders)
+        (embed_idx, embed_key), _head = large
+        source = AsyncDiskSource(
+            shard_dir, decoders + 2, specs, shard_paths=paths, read_ahead=4, pin=False
+        )
+        try:
+            source.get(embed_idx, embed_key)
+            decoder_group = source._group_of[0]
+            assert decoder_group not in source._last_get, (
+                "the embed fetch wrote the DECODER group's anchor; the first decoder "
+                "get can no longer establish it"
+            )
+            for idx in range(decoders):
+                source.get(idx, "w")
+            assert source._last_get.get(decoder_group) == decoders - 1, (
+                "the decoder group's anchor was never established: a cross-group "
+                "fetch is still speaking for it"
+            )
+            for idx in range(decoders - 1, decoders - 4, -1):
+                source.get(idx, "w")
+            assert source._direction.get(decoder_group) == -1, (
+                "walking down, the decoder group's direction is still +1"
+            )
+            assert source._still_wanted(decoders - 4), (
+                "the next layer the backward walk wants is not recognised as wanted, "
+                "so the eviction preference has degenerated to plain FIFO"
+            )
+        finally:
+            source.close()
