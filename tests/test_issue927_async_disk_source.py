@@ -226,7 +226,7 @@ class TestTheDeviceGetsTheLayerItAskedFor:
     ``StreamPrefetcher``) and checks the bytes that reach the DEVICE.
     """
 
-    @pytest.mark.parametrize("read_ahead", [1, 2, 4])
+    @pytest.mark.parametrize("read_ahead", [1, 2, 4, 8])
     def test_no_layer_reaches_the_device_holding_another_layers_weights(
         self, tmp_path, read_ahead
     ):
@@ -634,3 +634,103 @@ class TestPinningRefusesPageableMemory:
         monkeypatch.setattr(torch, "empty", _pageable_empty)
         with pytest.raises(RuntimeError, match="returned pageable memory"):
             AsyncDiskSource(shard_dir, N_LAYERS, spec, pin=True)
+
+
+class TestDepthSurvivesTheTurnaround:
+    """Depth measured on a fresh one-way walk is not the depth training gets.
+
+    Training walks forward, backward, forward, forever. The single-direction
+    tests above pass while delivered depth decays across the turnaround: FIFO
+    rotation is only in phase with the walk while the walk keeps going the same
+    way, so after a reversal it starts evicting layers still inside the
+    lookahead window -- the very next layer wanted, in the traced case. Measured
+    over 4 sweeps of 32 layers before the eviction policy was fixed: 2 of 3
+    sustained at read_ahead=4, and 5 of 7 at 8 with demand misses in both
+    directions.
+
+    This drives the PRODUCTION access pattern -- ``get`` immediately followed by
+    ``release``, which is what all four ``_release_source`` call sites do.
+    """
+
+    N_LAYERS = 32
+    SWEEPS = 4
+
+    @staticmethod
+    def _sweep(source, read_ahead, n_layers, sweeps):
+        """Walk up and down, returning (sustained depth, demand misses)."""
+        depths = []
+        misses = 0
+        for sweep in range(sweeps):
+            descending = sweep % 2 == 1
+            walk = range(n_layers - 1, -1, -1) if descending else range(n_layers)
+            for idx in walk:
+                staged_before_demand = idx in source._slot_of
+                source.get(idx, "w")
+                source.release(idx, None)
+                _settle(source)
+                if descending:
+                    depth = sum(1 for layer in source._slot_of if layer < idx)
+                    room = idx >= read_ahead - 1
+                else:
+                    depth = sum(1 for layer in source._slot_of if layer > idx)
+                    room = idx + read_ahead - 1 < n_layers
+                # The first sweep is cold, and the ends of a walk simply run
+                # out of layers to stage -- neither is the steady state.
+                if sweep >= 1 and room:
+                    depths.append(depth)
+                    if not staged_before_demand:
+                        misses += 1
+        return min(depths), misses
+
+    @pytest.mark.parametrize("read_ahead", [2, 4, 8])
+    def test_full_depth_is_sustained_across_repeated_reversals(
+        self, tmp_path, read_ahead
+    ):
+        shard_dir = _deep_shards(tmp_path, self.N_LAYERS)
+        spec = RamSource.layer_specs_from_shards(shard_dir, self.N_LAYERS)
+        source = AsyncDiskSource(
+            shard_dir, self.N_LAYERS, spec, read_ahead=read_ahead, pin=False
+        )
+        try:
+            sustained, misses = self._sweep(
+                source, read_ahead, self.N_LAYERS, self.SWEEPS
+            )
+            assert sustained == read_ahead - 1, (
+                f"read_ahead={read_ahead} peaks at the depth it promises on a "
+                f"one-way walk but only SUSTAINS {sustained} of {read_ahead - 1} "
+                f"across {self.SWEEPS} reversals. The eviction policy is dropping "
+                f"layers still inside the lookahead window."
+            )
+            assert misses == 0, (
+                f"{misses} layers were demanded before they were staged, across "
+                f"{self.SWEEPS} sweeps -- each one is a read the consumer waited on "
+                f"that the configured depth had already paid for"
+            )
+        finally:
+            source.close()
+
+    def test_a_layer_inside_the_window_is_not_the_eviction_victim(self, tmp_path):
+        """The mechanism, asserted directly rather than through its symptom."""
+        shard_dir = _deep_shards(tmp_path, self.N_LAYERS)
+        spec = RamSource.layer_specs_from_shards(shard_dir, self.N_LAYERS)
+        source = AsyncDiskSource(shard_dir, self.N_LAYERS, spec, read_ahead=4, pin=False)
+        try:
+            for idx in range(self.N_LAYERS):
+                source.get(idx, "w")
+                source.release(idx, None)
+            evicted_while_wanted = []
+            for idx in range(self.N_LAYERS - 1, -1, -1):
+                source.get(idx, "w")
+                source.release(idx, None)
+                _settle(source)
+                window = {idx - step for step in range(4) if idx - step >= 0}
+                staged = set(source._slot_of)
+                missing = sorted(window - staged)
+                if missing and idx >= 3:
+                    evicted_while_wanted.append((idx, missing))
+            assert not evicted_while_wanted, (
+                f"walking down, these layers were inside the lookahead window but "
+                f"not staged: {evicted_while_wanted[:4]}"
+            )
+        finally:
+            source.close()

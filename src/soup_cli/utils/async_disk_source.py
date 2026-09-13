@@ -206,6 +206,20 @@ class AsyncDiskSource:
         self._thread.start()
 
     # -- the reader ------------------------------------------------------
+    def _still_wanted(self, layer: int) -> bool:
+        """Is ``layer`` still inside the lookahead window the walk is heading into?
+
+        The window is ``read_ahead`` layers starting at the consumer's current
+        position and running in its current direction — exactly what
+        ``_plan_queue`` populates. A layer behind the walk, or beyond the far
+        edge, has already been used or is not wanted yet.
+        """
+        anchor = self._last_get
+        if anchor is None:
+            return False
+        step = (layer - anchor) * self._direction
+        return 0 <= step < self.read_ahead
+
     def _claim_slot(self, idx: int) -> Optional[int]:
         """Choose a staging slot to refill with layer ``idx``. Lock held.
 
@@ -216,19 +230,44 @@ class AsyncDiskSource:
         the group is held, and the caller waits for a release rather than
         picking a victim anyway — a fallback that overwrites a live slot is the
         defect, not a relief valve for it.
+
+        Among the slots it MAY take, it prefers one holding a layer the walk is
+        done with. Plain FIFO rotation is only right while the rotation
+        direction matches the walk direction; across the forward/backward
+        turnaround it goes out of phase and starts evicting layers still inside
+        the window — measured, 4 of 177 claims in one traced run, including
+        ``dir=-1 reading layer 20, evicted layer 19``, the very next layer
+        wanted. Re-reading it is not incorrect, but it is depth the setting
+        charged for and did not deliver: 2 of 3 sustained at ``read_ahead=4``,
+        5 of 7 at 8.
+
+        An empty slot counts as done-with, so a cold source still fills in
+        rotation order. The FIFO fallback stands when every takeable slot is
+        still wanted, which in steady state coincides with having nothing to
+        fetch — the window being fully resident is what makes ``_plan_queue``
+        return empty.
         """
         group = self._group_of[idx]
         flat = self._group_slots[group]
         start = self._next_slot[group]
-        for offset in range(len(flat)):
-            candidate = flat[(start + offset) % len(flat)]
-            if self._live[candidate]:
-                continue
-            self._next_slot[group] = (start + offset + 1) % len(flat)
-            for layer in [lay for lay, held in self._slot_of.items() if held == candidate]:
-                del self._slot_of[layer]
-            return candidate
-        return None
+        layer_in_slot = {held: lay for lay, held in self._slot_of.items()}
+        takeable = [
+            (offset, flat[(start + offset) % len(flat)])
+            for offset in range(len(flat))
+            if not self._live[flat[(start + offset) % len(flat)]]
+        ]
+        if not takeable:
+            return None
+        chosen_offset, chosen = takeable[0]
+        for offset, candidate in takeable:
+            held = layer_in_slot.get(candidate)
+            if held is None or not self._still_wanted(held):
+                chosen_offset, chosen = offset, candidate
+                break
+        self._next_slot[group] = (start + chosen_offset + 1) % len(flat)
+        for layer in [lay for lay, held in self._slot_of.items() if held == chosen]:
+            del self._slot_of[layer]
+        return chosen
 
     def _hold(self, idx: int) -> None:
         """Mark ``idx``'s slot as in use and implicitly release the rest. Lock held.
