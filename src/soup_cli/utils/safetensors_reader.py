@@ -114,6 +114,11 @@ def read_header(path: str) -> Dict[str, TensorRange]:
         if not isinstance(offsets, (list, tuple)) or len(offsets) != 2:
             raise ValueError(f"{path}: tensor {name!r} has no valid data_offsets")
         start, end = base + int(offsets[0]), base + int(offsets[1])
+        if start < base:
+            raise ValueError(
+                f"{path}: tensor {name!r} has data_offsets starting before the "
+                f"tensor-data region (byte {start}, header ends at {base})"
+            )
         if start > end:
             raise ValueError(f"{path}: tensor {name!r} has a reversed byte range")
         if end > size:

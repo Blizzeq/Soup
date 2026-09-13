@@ -105,6 +105,19 @@ class TestHeaderRefusesRatherThanGuesses:
         with pytest.raises(ValueError, match="byte range"):
             read_header(str(path))
 
+    def test_a_negative_start_offset_is_refused(self, tmp_path):
+        """A negative data_offsets[0] would otherwise address bytes inside the
+        JSON header itself rather than tensor data — reproduced upstream as
+        TensorRange(start=66, end=70) reading back the tail of the header
+        text with no exception raised."""
+        path = tmp_path / "negative_start.safetensors"
+        body = json.dumps(
+            {"w": {"dtype": "F32", "shape": [1], "data_offsets": [-4, 0]}}
+        ).encode()
+        path.write_bytes(struct.pack("<Q", len(body)) + body)
+        with pytest.raises(ValueError, match="tensor-data region"):
+            read_header(str(path))
+
 
 def test_tensor_range_is_frozen():
     entry = TensorRange(name="w", dtype="float32", shape=(2,), start=0, end=8)
