@@ -13,14 +13,22 @@ Windows commit for the file's whole size (#926), and holding one per decoder
 layer costs ~35 GB of charge for a 70B run.
 
 ``get(idx, name)`` keeps the interface ``RamSource`` and ``DiskSource`` share,
-so the buffer pool, the prefetcher and the layer wrapper are untouched and the
-v0.72.0 correctness gates carry over rather than being re-derived.
+so the prefetcher and the layer wrapper are untouched and the v0.72.0
+correctness gates carry over rather than being re-derived. ONE call is added
+rather than kept: ``release(idx, event)``. A reusable staging buffer is exactly
+what the other two sources do not have — ``RamSource`` holds every layer for the
+whole run and ``DiskSource`` returns a freshly allocated tensor per call, so
+neither can be recycled underneath an in-flight copy. This source can, and out
+of PINNED host memory ``dst.copy_(..., non_blocking=True)`` is still draining
+when ``load_async`` returns while ``pool.wait`` is a GPU-side ``wait_event``
+that does not block the Python thread at all. Measured through the real pool
+before ``release`` existed: 7 of 8 layers reached the device holding another
+layer's weights at ``read_ahead=1``, 6 of 8 at the default 2, 4 of 8 at 4.
 
 NO top-level torch: this module is imported by the trainer path only.
 """
 
 import logging
-import math
 import threading
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
@@ -32,10 +40,18 @@ MIN_STREAM_READ_AHEAD = 1
 MAX_STREAM_READ_AHEAD = 8
 DEFAULT_STREAM_READ_AHEAD = 2
 
-_ITEMSIZE = {
-    "bfloat16": 2, "float16": 2, "float32": 4, "float64": 8,
-    "int8": 1, "int16": 2, "int32": 4, "int64": 8, "uint8": 1, "bool": 1,
-}
+
+def _spec_key(layer_spec: Mapping[str, Tuple[Tuple[int, ...], str]]) -> tuple:
+    """A hashable identity for one layer's tensor names, shapes and dtypes.
+
+    Two layers share staging only if they agree on all three: a buffer sized for
+    a decoder layer cannot hold a vocabulary matrix, and a buffer keyed on
+    ``self_attn.q_proj.weight`` cannot answer ``model.embed_tokens.weight``.
+    """
+    return tuple(
+        (name, tuple(shape), dtype)
+        for name, (shape, dtype) in sorted(layer_spec.items())
+    )
 
 
 class AsyncDiskSource:
@@ -94,39 +110,88 @@ class AsyncDiskSource:
                     )
             self._ranges.append(header)
 
+        # The exact bytes that will be read, taken from the headers rather than
+        # recomputed from the spec: `read_header` already cross-checks each
+        # range against shape x itemsize, so a second dtype-size table here
+        # could only ever disagree with the one authority. `layer_stream.
+        # dtype_bytes` is THE table for everything that still needs one.
         self.disk_bytes = sum(
-            math.prod(shape) * _ITEMSIZE[dtype]
-            for per_layer in self._layer_specs
-            for shape, dtype in per_layer.values()
+            self._ranges[idx][name].nbytes
+            for idx in range(self.n_layers)
+            for name in self._layer_specs[idx]
         )
 
-        # `read_ahead` staging slots, each one layer's worth, allocated once.
+        # Staging is allocated per DISTINCT layer spec, NOT from layer 0's.
+        # `_build_source` hands this source the decoder layers followed by the
+        # vocabulary-sized embed / lm_head shards, whose tensor keys are
+        # entirely different; sizing every slot from layer 0 made the reader
+        # thread raise KeyError on the first forward turnaround of any real
+        # model and poisoned the source permanently, where `DiskSource` simply
+        # returns the tensor.
+        groups: Dict[tuple, int] = {}
+        specs_by_group: List[Mapping[str, Tuple[Tuple[int, ...], str]]] = []
+        members: List[int] = []
+        self._group_of: List[int] = []
+        for idx in range(self.n_layers):
+            key = _spec_key(self._layer_specs[idx])
+            group = groups.get(key)
+            if group is None:
+                group = len(groups)
+                groups[key] = group
+                specs_by_group.append(self._layer_specs[idx])
+                members.append(0)
+            members[group] += 1
+            self._group_of.append(group)
+
         self._slots: List[Dict[str, Any]] = []
+        self._group_slots: List[List[int]] = []
         self.nbytes = 0
-        for _ in range(read_ahead):
-            slot: Dict[str, Any] = {}
-            for name, (shape, dtype) in self._layer_specs[0].items():
-                dst = torch.empty(
-                    tuple(shape),
-                    dtype=getattr(torch, dtype),
-                    device="cpu",
-                    pin_memory=self.pinned,
-                )
-                if dst.device.type != "cpu":
-                    raise RuntimeError(
-                        "layer streaming's async disk source requested a CPU "
-                        f"tensor, but torch returned {dst.device}."
+        for group, layer_spec in enumerate(specs_by_group):
+            # Depth beyond the number of layers sharing a spec buys nothing and
+            # costs a whole vocabulary matrix of pinned host memory: embed and
+            # an untied lm_head are one layer each.
+            flat: List[int] = []
+            for _ in range(min(read_ahead, members[group])):
+                slot: Dict[str, Any] = {}
+                for name, (shape, dtype) in layer_spec.items():
+                    dst = torch.empty(
+                        tuple(shape),
+                        dtype=getattr(torch, dtype),
+                        device="cpu",
+                        pin_memory=self.pinned,
                     )
-                slot[name] = dst
-                self.nbytes += dst.numel() * dst.element_size()
-            self._slots.append(slot)
+                    if dst.device.type != "cpu":
+                        raise RuntimeError(
+                            "layer streaming's async disk source requested a CPU "
+                            f"tensor, but torch returned {dst.device}."
+                        )
+                    # Mirrors RamSource: a box that hands back pageable memory
+                    # would otherwise report pinned=True while silently paying
+                    # the ~97% -> ~79% GPU-utilisation cost of a synchronous
+                    # host-to-device copy.
+                    if self.pinned and not dst.is_pinned():
+                        raise RuntimeError(
+                            "layer streaming requested pinned CPU RAM, but torch "
+                            "returned pageable memory; retry with pin=False."
+                        )
+                    slot[name] = dst
+                    self.nbytes += dst.numel() * dst.element_size()
+                flat.append(len(self._slots))
+                self._slots.append(slot)
+            self._group_slots.append(flat)
 
         self._lock = threading.Lock()
         self._ready = threading.Condition(self._lock)
         self._wanted: Optional[int] = 0
         self._slot_of: Dict[int, int] = {}
         self._in_flight: Optional[int] = None
-        self._next_slot = 0
+        self._next_slot: List[int] = [0] * len(self._group_slots)
+        # Per staging slot: handed to the consumer and not released yet, and
+        # the event that says when its copy has drained.
+        self._live: List[bool] = [False] * len(self._slots)
+        self._drain: List[Any] = [None] * len(self._slots)
+        self._last_get: Optional[int] = None
+        self._direction = 1
         self._error: Optional[BaseException] = None
         self._closed = False
         self._thread = threading.Thread(
@@ -135,6 +200,56 @@ class AsyncDiskSource:
         self._thread.start()
 
     # -- the reader ------------------------------------------------------
+    def _claim_slot(self, idx: int) -> Optional[int]:
+        """Choose a staging slot to refill with layer ``idx``. Lock held.
+
+        Only slots in ``idx``'s spec group are eligible — a decoder buffer
+        cannot hold a vocabulary matrix. A slot the consumer is still holding
+        is never chosen: overwriting one is what put another layer's weights on
+        the device through the real buffer pool. ``None`` means every slot in
+        the group is held, and the caller waits for a release rather than
+        picking a victim anyway — a fallback that overwrites a live slot is the
+        defect, not a relief valve for it.
+        """
+        group = self._group_of[idx]
+        flat = self._group_slots[group]
+        start = self._next_slot[group]
+        for offset in range(len(flat)):
+            candidate = flat[(start + offset) % len(flat)]
+            if self._live[candidate]:
+                continue
+            self._next_slot[group] = (start + offset + 1) % len(flat)
+            for layer in [lay for lay, held in self._slot_of.items() if held == candidate]:
+                del self._slot_of[layer]
+            return candidate
+        return None
+
+    def _hold(self, idx: int) -> None:
+        """Mark ``idx``'s slot as in use and implicitly release the rest. Lock held.
+
+        ``release()`` is the precise signal and the real buffer pool sends it.
+        A consumer that does not — every caller that predates this source, and
+        the byte-identity gate, which calls ``get`` directly — still gets the
+        contract this design always had: a reference from ``get`` is valid until
+        your next ``get`` for a different layer. Without that, slots handed out
+        to a release-unaware consumer would never come back and the reader would
+        stall until ``get``'s own timeout fired.
+
+        The implicit release carries NO drain event, which is correct: a
+        consumer that never calls ``release`` never enqueued an asynchronous
+        copy out of this buffer either.
+        """
+        keep = self._slot_of.get(idx)
+        freed = False
+        for slot in range(len(self._slots)):
+            if slot != keep and self._live[slot]:
+                self._live[slot] = False
+                freed = True
+        if keep is not None:
+            self._live[keep] = True
+        if freed:
+            self._ready.notify_all()
+
     def _run(self) -> None:
         try:
             while True:
@@ -147,14 +262,29 @@ class AsyncDiskSource:
                     self._wanted = None
                     if idx in self._slot_of:
                         continue
-                    slot_index = self._next_slot
-                    self._next_slot = (self._next_slot + 1) % self.read_ahead
-                    evicted = [
-                        layer for layer, s in self._slot_of.items() if s == slot_index
-                    ]
-                    for layer in evicted:
-                        del self._slot_of[layer]
+                    claimed = self._claim_slot(idx)
+                    if claimed is None:
+                        # Every slot in this group is still handed out. Put the
+                        # request back and wait for a release: the alternative
+                        # is overwriting a buffer the consumer is reading, which
+                        # is the whole defect. If no release ever comes, `get`
+                        # surfaces it as its own loud timeout rather than a
+                        # silently wrong weight reaching the device.
+                        self._wanted = idx
+                        self._ready.wait(timeout=1.0)
+                        continue
+                    slot_index = claimed
+                    draining = self._drain[slot_index]
+                    self._drain[slot_index] = None
                     self._in_flight = idx
+                # OUTSIDE the lock: the compute thread must be able to call
+                # get() while this waits. The event was recorded on a stream
+                # that already waited on the compute stream, so it depends only
+                # on work the GPU has been handed — never on this process
+                # taking another Python step, which is what makes waiting here
+                # safe rather than a deadlock.
+                if draining is not None:
+                    draining.synchronize()
                 slot = self._slots[slot_index]
                 with open(self._paths[idx], "rb") as handle:
                     for name, dst in slot.items():
@@ -173,8 +303,44 @@ class AsyncDiskSource:
             self._in_flight = None
             self._ready.notify_all()
 
+    def _note_direction(self, idx: int) -> None:
+        """Track which way the consumer is walking the stack. Lock held.
+
+        ``StreamPrefetcher`` walks 0..L-1 on the forward pass and L-1..0 on the
+        backward recompute, so arming ``idx + 1`` unconditionally spent the
+        whole backward half fetching a layer the consumer had already passed —
+        wasted I/O that also evicted a slot the next ``get`` wanted. A repeat of
+        the same index carries no direction information and leaves it alone.
+
+        A fetch from a DIFFERENT spec group is not a step along this walk: the
+        tail prefetch of ``model.embed_tokens.weight`` sits at an index above
+        every decoder layer, so letting it speak would read as a forward step at
+        exactly the turnaround where the direction has just flipped. It is
+        ignored entirely — including for ``_last_get``, so the decoder step
+        after it still compares against the last decoder step.
+        """
+        last = self._last_get
+        if last is not None and self._group_of[idx] != self._group_of[last]:
+            return
+        self._last_get = idx
+        if last is not None and idx != last:
+            self._direction = 1 if idx > last else -1
+
     # -- the interface ---------------------------------------------------
     def get(self, idx: int, name: str):
+        """Hand back layer ``idx``'s ``name``, staged in a REUSABLE host buffer.
+
+        This is a borrow, not a copy — which is the point, and which is the one
+        way this source differs from ``RamSource`` (holds everything forever)
+        and ``DiskSource`` (allocates per call). Two rules follow:
+
+        * The reference is valid until your next ``get`` for a different layer.
+        * If you enqueue an ASYNCHRONOUS copy out of it, you must say so with
+          ``release(idx, event)`` — otherwise the next ``get`` is taken as
+          "done", the reader refills the buffer, and your copy drains from
+          whatever it now holds. ``LayerBufferPool`` and ``LargeLayerBufferPool``
+          both do this; see ``layer_stream_runtime._release_source``.
+        """
         with self._ready:
             while True:
                 if self._error is not None:
@@ -184,26 +350,33 @@ class AsyncDiskSource:
                 slot_index = self._slot_of.get(idx)
                 if slot_index is not None:
                     tensor = self._slots[slot_index][name]
-                    nxt = idx + 1
-                    # Arming the next read is only safe with a SPARE slot. The
-                    # demand pattern only ever chases "current + 1", so the
-                    # round robin's eviction target for `nxt` is always
-                    # `nxt - read_ahead`. With one slot that is `idx` itself —
-                    # the tensor this call is about to hand back — so eagerly
-                    # wanting `nxt` would arm the reader to overwrite the very
-                    # buffer the caller is still holding a live reference to
-                    # (measured: a torch.equal against a second, non-evicting
-                    # source flips false while the caller still holds `tensor`).
-                    # With >= 2 slots the eviction target is strictly earlier
-                    # than `idx`, which the caller is done with.
+                    # Held from here until release() says the consumer's copy
+                    # has drained. Without this the window between handing the
+                    # reference out and the copy being enqueued is enough for
+                    # the reader to overwrite it.
+                    self._hold(idx)
+                    self._note_direction(idx)
+                    nxt = idx + self._direction
+                    # Arming the next read only buys overlap with a SPARE slot.
+                    # At depth 1 the only slot is the one being handed back, so
+                    # the reader would claim nothing and wait for its release —
+                    # pure overhead. (Before the live-slot rule below, it did
+                    # something worse: it armed the reader to overwrite the very
+                    # buffer this call was returning, which is how a read_ahead=1
+                    # source handed back another layer's bytes.)
                     if (
                         self.read_ahead > 1
-                        and nxt < self.n_layers
+                        and 0 <= nxt < self.n_layers
                         and nxt not in self._slot_of
                     ):
                         self._wanted = nxt
                         self._ready.notify_all()
                     return tensor
+                # Asking for a layer that is not resident ends any implicit hold
+                # on the others, so the reader always has a slot to claim. This
+                # is what keeps a release-unaware consumer from deadlocking a
+                # reader that now refuses to overwrite a live slot.
+                self._hold(idx)
                 if self._in_flight != idx and self._wanted != idx:
                     self._wanted = idx
                     self._ready.notify_all()
@@ -220,6 +393,33 @@ class AsyncDiskSource:
                         f"30 s. Refusing rather than blocking: a training run that "
                         f"stops without an error is worse than one that fails."
                     )
+
+    def release(self, idx: int, event: Any = None) -> None:
+        """Say the consumer is done reading layer ``idx`` out of its staging slot.
+
+        ``LayerBufferPool.load_async`` enqueues ``dst.copy_(..., non_blocking=
+        True)`` on a side stream out of PINNED host memory, so the copy is still
+        draining when the call returns, and ``pool.wait`` is a GPU-side
+        ``wait_event`` that never blocks the Python thread. Recycling the
+        staging buffer at that point rewrites the bytes the copy is reading:
+        measured through the real pool, 6 of 8 layers reached the device holding
+        another layer's weights at the default depth.
+
+        ``event`` is a CUDA event recorded after those copies — the reader waits
+        on it before reusing the slot. ``None`` means the copy was already
+        synchronous (no side stream, or a non-CUDA device) and the slot is free
+        immediately. A layer that is no longer resident is ignored: it can only
+        have been evicted, which requires having been released already.
+        """
+        with self._ready:
+            slot_index = self._slot_of.get(idx)
+            if slot_index is None:
+                return
+            self._drain[slot_index] = event
+            self._live[slot_index] = False
+            # The reader may be parked because every slot in this group was
+            # held; this is the event it was waiting for.
+            self._ready.notify_all()
 
     def close(self) -> None:
         """Stop the reader and release the staging buffers. Idempotent."""

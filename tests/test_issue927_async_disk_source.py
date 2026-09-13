@@ -1,6 +1,7 @@
 """#927 — the disk tier reads on a background thread, not on the compute thread."""
 
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -187,3 +188,286 @@ class TestFailuresAreLoudAndNeverHang:
                 AsyncDiskSource(shard_dir, N_LAYERS, spec, read_ahead=bad, pin=False)
         with pytest.raises(ValueError, match="must be an int"):
             AsyncDiskSource(shard_dir, N_LAYERS, spec, read_ahead=True, pin=False)
+
+
+# ==========================================================================
+# the hazards pin=False cannot express
+# ==========================================================================
+_NO_CUDA = not torch.cuda.is_available()
+
+
+def _uniform_shards(tmp_path: Path, n_layers: int, size: int) -> str:
+    """One tensor per layer, every byte equal to the layer index.
+
+    A leak therefore names the layer it came from, which a random fixture
+    cannot do: `torch.equal` says "different", this says "layer 6 is sitting in
+    layer 0's buffer".
+    """
+    from soup_cli.utils.layer_shard import layer_shard_path
+
+    out = tmp_path / "uniform"
+    out.mkdir()
+    for idx in range(n_layers):
+        save_file(
+            {"w": torch.full((size,), idx, dtype=torch.uint8)},
+            layer_shard_path(str(out), idx),
+        )
+    return str(out)
+
+
+@pytest.mark.skipif(_NO_CUDA, reason="the hazard is a CUDA copy draining out of pinned host memory")
+class TestTheDeviceGetsTheLayerItAskedFor:
+    """THE gate for the recycle-under-an-in-flight-copy defect.
+
+    Every other test in this file runs ``pin=False``, where a host-to-device
+    copy is synchronous and the hazard cannot exist — so the suite was blind to
+    it by construction while ``pin=True`` is the default AND the production
+    setting. This drives the REAL consumer (``LayerBufferPool`` +
+    ``StreamPrefetcher``) and checks the bytes that reach the DEVICE.
+    """
+
+    @pytest.mark.parametrize("read_ahead", [1, 2, 4])
+    def test_no_layer_reaches_the_device_holding_another_layers_weights(
+        self, tmp_path, read_ahead
+    ):
+        from soup_cli.utils.layer_shard import layer_shard_path
+        from soup_cli.utils.layer_stream_runtime import LayerBufferPool, StreamPrefetcher
+
+        n_layers = 8
+        shard_dir = _uniform_shards(tmp_path, n_layers, 8 * 1024 * 1024)
+        spec = RamSource.layer_specs_from_shards(shard_dir, n_layers)
+        source = AsyncDiskSource(
+            shard_dir, n_layers, spec, read_ahead=read_ahead, pin=True
+        )
+        try:
+            assert source.pinned, "the hazard needs genuinely pinned staging"
+            pool = LayerBufferPool(spec[0], n_buffers=2, device="cuda")
+            stream = torch.cuda.Stream()
+            prefetcher = StreamPrefetcher(pool, source, n_layers, stream)
+
+            # Warm the page cache: a reader blocked on cold I/O cannot run
+            # ahead far enough to overwrite anything, which would hide the bug.
+            for idx in range(n_layers):
+                Path(layer_shard_path(shard_dir, idx)).read_bytes()
+
+            # Put the GPU behind. Prefetching only pays off when it is, and the
+            # copy only stays in flight long enough to be clobbered when it is.
+            hog = torch.randn(4096, 4096, device="cuda")
+            for _ in range(200):
+                hog = hog @ hog.clamp(-1, 1)
+
+            seen = []
+            prefetcher.prime()
+            for idx in range(n_layers):
+                buffers = pool.wait(idx)  # a GPU-side wait_event, not a host one
+                prefetcher.advance(idx)  # -> load_async(idx+1) -> source.get(...)
+                seen.append(buffers["w"].clone())
+            torch.cuda.synchronize()
+
+            wrong = {
+                idx: torch.unique(got).tolist()
+                for idx, got in enumerate(seen)
+                if torch.unique(got).tolist() != [idx]
+            }
+            assert not wrong, (
+                f"read_ahead={read_ahead}: {len(wrong)} of {n_layers} layers reached "
+                f"the device holding another layer's weights — {wrong} (each value is "
+                f"the layer the bytes actually came from). The staging buffer was "
+                f"recycled while its copy was still draining."
+            )
+        finally:
+            source.close()
+
+    def test_the_same_harness_is_clean_through_the_shipped_sources(self, tmp_path):
+        """A control: if this ever fails, the harness is wrong, not the source."""
+        from soup_cli.utils.layer_stream_runtime import LayerBufferPool, StreamPrefetcher
+
+        n_layers = 8
+        shard_dir = _uniform_shards(tmp_path, n_layers, 8 * 1024 * 1024)
+        spec = RamSource.layer_specs_from_shards(shard_dir, n_layers)
+        for source in (
+            DiskSource(shard_dir, n_layers, spec),
+            RamSource(shard_dir, n_layers, spec, pin=True),
+        ):
+            pool = LayerBufferPool(spec[0], n_buffers=2, device="cuda")
+            stream = torch.cuda.Stream()
+            prefetcher = StreamPrefetcher(pool, source, n_layers, stream)
+            hog = torch.randn(4096, 4096, device="cuda")
+            for _ in range(200):
+                hog = hog @ hog.clamp(-1, 1)
+            seen = []
+            prefetcher.prime()
+            for idx in range(n_layers):
+                buffers = pool.wait(idx)
+                prefetcher.advance(idx)
+                seen.append(buffers["w"].clone())
+            torch.cuda.synchronize()
+            for idx, got in enumerate(seen):
+                assert torch.unique(got).tolist() == [idx], (
+                    f"{type(source).__name__} layer {idx} is wrong — the harness, "
+                    f"not the source under test, is at fault"
+                )
+
+    def test_pinned_is_measured_not_asserted(self, tmp_path):
+        """``pinned=True`` must mean the staging really is page-locked.
+
+        ``RamSource`` checks ``dst.is_pinned()`` because a box that hands back
+        pageable memory would otherwise report the fast path while silently
+        paying the ~97% -> ~79% GPU-utilisation cost of a synchronous copy.
+        """
+        shard_dir = _shards(tmp_path)
+        source = AsyncDiskSource(shard_dir, N_LAYERS, _spec(shard_dir), pin=True)
+        try:
+            assert source.pinned is True
+            staged = [dst for slot in source._slots for dst in slot.values()]
+            assert staged, "no staging was allocated"
+            assert all(dst.is_pinned() for dst in staged), (
+                "pinned=True but torch returned pageable memory"
+            )
+        finally:
+            source.close()
+
+
+class TestTheReadHappensAhead:
+    """A synchronous implementation passes every other test in this file.
+
+    ``get`` returning the right bytes is necessary and not sufficient: the
+    point of the whole source is that the read is OFF the compute thread and
+    already done before the consumer asks. Nothing pinned that.
+    """
+
+    def test_reads_run_on_the_reader_thread_not_the_caller(self, tmp_path, monkeypatch):
+        import soup_cli.utils.async_disk_source as module
+
+        shard_dir = _shards(tmp_path)
+        spec = _spec(shard_dir)
+        threads = []
+        real = module.read_into
+
+        def recording(handle, entry, tensor):
+            threads.append(threading.current_thread())
+            return real(handle, entry, tensor)
+
+        monkeypatch.setattr(module, "read_into", recording)
+        source = AsyncDiskSource(shard_dir, N_LAYERS, spec, read_ahead=2, pin=False)
+        try:
+            source.get(0, "input_layernorm.weight")
+            assert threads, "nothing was read at all"
+            caller = threading.current_thread()
+            offenders = sorted({t.name for t in threads if t is caller})
+            assert not offenders, (
+                f"the read ran on the calling thread ({offenders}) — this source "
+                f"exists to keep it off the compute thread"
+            )
+            assert {t.name for t in threads} == {"soup-layer-reader"}
+        finally:
+            source.close()
+
+    def test_the_next_layer_arrives_before_anyone_asks_for_it(self, tmp_path):
+        shard_dir = _shards(tmp_path)
+        spec = _spec(shard_dir)
+        source = AsyncDiskSource(shard_dir, N_LAYERS, spec, read_ahead=2, pin=False)
+        try:
+            source.get(0, "input_layernorm.weight")
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline and 1 not in source._slot_of:
+                time.sleep(0.005)
+            assert 1 in source._slot_of, (
+                "layer 1 was never staged, though nothing asked for it yet — the "
+                "source read on demand instead of ahead"
+            )
+        finally:
+            source.close()
+
+
+class TestTheShapeBuildSourceActuallyPasses:
+    """``_build_source`` hands this source per-layer specs whose trailing
+    entries are the vocabulary-sized embed / lm_head shards, with ENTIRELY
+    different tensor keys (layer_stream_runtime.py, ``source_specs``). Sizing
+    every staging slot from layer 0 made the reader raise ``KeyError`` on the
+    reader thread at the first forward turnaround of any real model, poisoning
+    the source permanently, where ``DiskSource`` simply returns the tensor.
+    """
+
+    @staticmethod
+    def _hetero(tmp_path: Path):
+        from soup_cli.utils.layer_shard import layer_shard_path
+
+        out = tmp_path / "hetero"
+        out.mkdir()
+        torch.manual_seed(927)
+        for idx in range(2):
+            save_file(
+                {"self_attn.q_proj.weight": torch.rand(8, 4, dtype=torch.float32)},
+                layer_shard_path(str(out), idx),
+            )
+        big = out / "embed.safetensors"
+        save_file(
+            {"model.embed_tokens.weight": torch.rand(64, 4, dtype=torch.float32)},
+            str(big),
+        )
+        specs = [
+            {"self_attn.q_proj.weight": ((8, 4), "float32")},
+            {"self_attn.q_proj.weight": ((8, 4), "float32")},
+            {"model.embed_tokens.weight": ((64, 4), "float32")},
+        ]
+        paths = [
+            layer_shard_path(str(out), 0),
+            layer_shard_path(str(out), 1),
+            str(big),
+        ]
+        return str(out), specs, paths
+
+    def test_the_large_layer_comes_back_exactly_as_disk_source_returns_it(
+        self, tmp_path
+    ):
+        shard_dir, specs, paths = self._hetero(tmp_path)
+        shipped = DiskSource(shard_dir, 3, specs, shard_paths=paths)
+        ours = AsyncDiskSource(
+            shard_dir, 3, specs, shard_paths=paths, read_ahead=2, pin=False
+        )
+        try:
+            for idx, per_layer in enumerate(specs):
+                for name in per_layer:
+                    theirs = shipped.get(idx, name)
+                    mine = ours.get(idx, name)
+                    assert mine.shape == theirs.shape, (idx, name)
+                    assert torch.equal(mine, theirs), (idx, name)
+        finally:
+            ours.close()
+            shipped.close()
+
+    def test_staging_is_reported_honestly_for_every_distinct_spec(self, tmp_path):
+        """Extra host memory is fine; misreporting it is not.
+
+        One slot per distinct spec beyond the decoder's own depth: the embed
+        shard is one layer, so depth past 1 there would buy nothing and cost a
+        whole vocabulary matrix.
+        """
+        shard_dir, specs, paths = self._hetero(tmp_path)
+        source = AsyncDiskSource(
+            shard_dir, 3, specs, shard_paths=paths, read_ahead=2, pin=False
+        )
+        try:
+            decoder = 8 * 4 * 4
+            embed = 64 * 4 * 4
+            assert source.nbytes == 2 * decoder + embed
+            observed = sum(
+                dst.numel() * dst.element_size()
+                for slot in source._slots
+                for dst in slot.values()
+            )
+            assert source.nbytes == observed, "nbytes disagrees with what was allocated"
+        finally:
+            source.close()
+
+    def test_disk_bytes_counts_what_the_headers_say(self, tmp_path):
+        """Not recomputed from the spec through a fourth dtype-size table."""
+        shard_dir, specs, paths = self._hetero(tmp_path)
+        source = AsyncDiskSource(
+            shard_dir, 3, specs, shard_paths=paths, read_ahead=2, pin=False
+        )
+        try:
+            assert source.disk_bytes == 2 * (8 * 4 * 4) + 64 * 4 * 4
+        finally:
+            source.close()

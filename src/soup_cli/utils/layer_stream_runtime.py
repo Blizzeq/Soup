@@ -629,6 +629,28 @@ def large_layer_buffer_bytes(shard_dir: str, index: Any) -> int:
 # ==========================================================================
 # Tier 0 — pre-allocated VRAM buffers (plan 5.4)
 # ==========================================================================
+def _release_source(source: Any, idx: int, event: Any) -> None:
+    """Tell a staging source the copy out of layer ``idx`` has been enqueued.
+
+    ``RamSource`` holds every layer for the whole run and ``DiskSource`` returns
+    a freshly allocated tensor per call, so neither can have a buffer recycled
+    underneath an in-flight copy and neither defines ``release``. A source that
+    stages into a small pool of reusable HOST buffers can: out of PINNED memory
+    ``dst.copy_(..., non_blocking=True)`` is still draining when ``load_async``
+    returns, and ``wait()`` is a GPU-side ``wait_event`` that never blocks the
+    Python thread — so the reader is free to run ahead and overwrite the bytes
+    the copy is reading. Measured through this pool against ``AsyncDiskSource``
+    before this call existed: 7 of 8 layers reached the device holding another
+    layer's weights at read_ahead=1, 6 of 8 at the default 2, 4 of 8 at 4.
+
+    Duck-typed rather than isinstance-gated so the two shipped sources stay
+    untouched and a future source opts in by defining the method.
+    """
+    release = getattr(source, "release", None)
+    if callable(release):
+        release(idx, event)
+
+
 class LayerBufferPool:
     """N pre-allocated per-layer buffers. Never allocates inside the loop —
     that is what keeps the allocator from fragmenting (plan P7)."""
@@ -685,10 +707,16 @@ class LayerBufferPool:
                     dst = self.buffers[slot][name]
                     dst.copy_(source.get(idx, name), non_blocking=True)
                 self.events[slot].record(stream)
+            _release_source(source, idx, self.events[slot])
         else:
             for name in keys:
                 dst = self.buffers[slot][name]
                 dst.copy_(source.get(idx, name))
+            # No event: this branch's copy has already finished when `copy_`
+            # returns, so the source's buffer is free NOW rather than when a
+            # stream drains. Saying so is not decoration — a source that stages
+            # into a small reusable pool refills sooner for it.
+            _release_source(source, idx, None)
         self.owner[slot] = idx
         self.loads += 1
         return slot
@@ -768,8 +796,10 @@ class LargeLayerBufferPool:
             with torch.cuda.stream(stream):
                 dst.copy_(source.get(source_idx, key), non_blocking=True)
                 self.event.record(stream)
+            _release_source(source, source_idx, self.event)
         else:
             dst.copy_(source.get(source_idx, key))
+            _release_source(source, source_idx, None)
         self.owner = key
         self.loads += 1
 
