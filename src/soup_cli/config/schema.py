@@ -9,8 +9,11 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 # runtime validator's message can never disagree (layer_stream has no torch).
 from soup_cli.utils.layer_stream import (
     DEFAULT_STREAM_BUFFERS,
+    DEFAULT_STREAM_READ_AHEAD,
     MAX_STREAM_BUFFERS,
+    MAX_STREAM_READ_AHEAD,
     MIN_STREAM_BUFFERS,
+    MIN_STREAM_READ_AHEAD,
 )
 from soup_cli.utils.layer_stream import (
     ROLLOUT_STREAM_TASKS as _STREAM_ROLLOUT_TASKS,
@@ -3203,6 +3206,40 @@ class TrainingConfig(BaseModel):
             raise ValueError("training.stream_buffers must be an int, not bool")
         return v
 
+    # #927 — depth of the async disk-tier reader's background lookahead. NOT
+    # the same quantity as stream_buffers (VRAM buffers): this is HOST-side
+    # pinned-memory staging ahead of the disk read. One staging slot is always
+    # held by the layer currently being consumed, so a setting of N stages
+    # N-1 layers ahead of it, not N — measured across settings 1/2/4/8 giving
+    # 0/1/3/7 layers staged ahead, on both forward and backward passes. A
+    # description that promised N layers of lookahead from a setting of N
+    # would repeat the exact defect #748 exists to catch: a documented number
+    # that does not do what it says.
+    stream_read_ahead: int = Field(
+        default=DEFAULT_STREAM_READ_AHEAD,
+        ge=MIN_STREAM_READ_AHEAD,
+        le=MAX_STREAM_READ_AHEAD,
+        description=(
+            "Layers the async disk tier stages ahead on its background "
+            "thread. One staging slot is always held by the layer currently "
+            "being consumed, so a setting of N stages N-1 layers ahead, not "
+            "N: 1 = the read merely leaves the compute thread (nothing "
+            "staged ahead of the one in use), 2 = one layer in flight while "
+            "one is consumed, up to "
+            f"{MAX_STREAM_READ_AHEAD - 1} staged ahead at the maximum "
+            f"setting of {MAX_STREAM_READ_AHEAD}. Each level costs one layer "
+            "of pinned host memory, which is 441 MB on a 70B."
+        ),
+    )
+
+    @field_validator("stream_read_ahead", mode="before")
+    @classmethod
+    def _validate_stream_read_ahead_int(cls, v: Any) -> Any:
+        """Reject bool-as-int (bool subclasses int), mirrors stream_buffers."""
+        if isinstance(v, bool):
+            raise ValueError("training.stream_read_ahead must be an int, not bool")
+        return v
+
     stream_pin: Optional[bool] = Field(
         default=None,
         description=(
@@ -5171,6 +5208,7 @@ class SoupConfig(BaseModel):
                 tcfg.stream_source != "auto"
                 or tcfg.stream_ngram_source != "auto"
                 or tcfg.stream_buffers != 2
+                or tcfg.stream_read_ahead != DEFAULT_STREAM_READ_AHEAD
                 or tcfg.stream_vram_override is not None
                 or tcfg.stream_vram_probe
                 or tcfg.stream_disk_kind is not None
@@ -5178,7 +5216,7 @@ class SoupConfig(BaseModel):
             ):
                 raise ValueError(
                     "training.stream_source / training.stream_ngram_source / "
-                    "training.stream_buffers / "
+                    "training.stream_buffers / training.stream_read_ahead / "
                     "training.stream_vram_override / training.stream_vram_probe "
                     "/ training.stream_disk_kind / training.stream_pin set but "
                     "stream_layers is false; set stream_layers=true to stream the "

@@ -61,6 +61,15 @@ MIN_STREAM_BUFFERS = 2
 MAX_STREAM_BUFFERS = 8
 DEFAULT_STREAM_BUFFERS = 2
 
+# Re-exported, not redeclared: the schema imports its bound from here and the
+# runtime declares it, so the message and the check cannot disagree (the same
+# reasoning as stream_buffers).
+from soup_cli.utils.async_disk_source import (  # noqa: E402
+    DEFAULT_STREAM_READ_AHEAD,  # noqa: F401
+    MAX_STREAM_READ_AHEAD,  # noqa: F401
+    MIN_STREAM_READ_AHEAD,  # noqa: F401
+)
+
 # --- tasks ----------------------------------------------------------------
 #: Tasks whose trainers can run against a streamed base (v0.72.4).
 #:
