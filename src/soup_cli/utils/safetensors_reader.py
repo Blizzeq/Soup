@@ -107,7 +107,13 @@ def read_header(path: str) -> Dict[str, TensorRange]:
                 f"supported: {', '.join(sorted(_DTYPES))}"
             )
         dtype = _DTYPES[raw_dtype]
-        shape = tuple(int(dim) for dim in meta.get("shape", []))
+        # No default: ``dict.get(key, default)`` substitutes only when the KEY is
+        # absent, so a stored ``null`` would slip a default past this check and
+        # raise a bare TypeError at the comprehension. Mirrors data_offsets below.
+        raw_shape = meta.get("shape")
+        if not isinstance(raw_shape, (list, tuple)):
+            raise ValueError(f"{path}: tensor {name!r} has no valid shape")
+        shape = tuple(int(dim) for dim in raw_shape)
         if any(dim < 0 for dim in shape):
             raise ValueError(f"{path}: tensor {name!r} has a negative dimension")
         offsets = meta.get("data_offsets")

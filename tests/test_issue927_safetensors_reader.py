@@ -128,6 +128,51 @@ class TestHeaderRefusesRatherThanGuesses:
         with pytest.raises(ValueError, match="tensor-data region"):
             read_header(str(path))
 
+    @staticmethod
+    def _shard_with_shape(tmp_path: Path, entry: dict) -> str:
+        """A one-tensor shard whose header entry is exactly ``entry``.
+
+        Everything except ``shape`` is well-formed and the tensor bytes are
+        present, so the only refusal the file can earn is the shape one.
+        """
+        path = tmp_path / "shape.safetensors"
+        body = json.dumps({"w": entry}).encode()
+        path.write_bytes(struct.pack("<Q", len(body)) + body + b"\x00" * 4)
+        return str(path)
+
+    def test_a_missing_shape_is_refused_rather_than_read_as_a_scalar(self, tmp_path):
+        """No ``shape`` key at all. A default of ``[]`` would silently call this
+        a 0-dim scalar; the byte-range check then only disagrees by luck."""
+        path = self._shard_with_shape(tmp_path, {"dtype": "F32", "data_offsets": [0, 4]})
+        with pytest.raises(ValueError, match="tensor 'w' has no valid shape"):
+            read_header(path)
+
+    def test_a_null_shape_is_refused_by_name(self, tmp_path):
+        """``"shape": null`` — ``dict.get(key, default)`` does NOT substitute the
+        default for a stored ``None``, so this is the case a default cannot save:
+        without the type check it raises a bare TypeError naming neither the file
+        nor the tensor."""
+        path = self._shard_with_shape(
+            tmp_path, {"dtype": "F32", "shape": None, "data_offsets": [0, 4]}
+        )
+        with pytest.raises(ValueError, match="tensor 'w' has no valid shape"):
+            read_header(path)
+
+    def test_a_non_list_shape_is_refused_by_name(self, tmp_path):
+        path = self._shard_with_shape(
+            tmp_path, {"dtype": "F32", "shape": 4, "data_offsets": [0, 4]}
+        )
+        with pytest.raises(ValueError, match="tensor 'w' has no valid shape"):
+            read_header(path)
+
+    def test_the_refusal_names_the_file_as_well_as_the_tensor(self, tmp_path):
+        path = self._shard_with_shape(
+            tmp_path, {"dtype": "F32", "shape": None, "data_offsets": [0, 4]}
+        )
+        with pytest.raises(ValueError) as excinfo:
+            read_header(path)
+        assert "shape.safetensors" in str(excinfo.value)
+
 
 def test_tensor_range_is_frozen():
     entry = TensorRange(name="w", dtype="float32", shape=(2,), start=0, end=8)
