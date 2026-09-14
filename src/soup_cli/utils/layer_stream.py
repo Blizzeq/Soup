@@ -1607,8 +1607,9 @@ def build_stream_plan(
             notes.append(
                 "base does not fit in RAM — streaming from the NVMe disk tier "
                 "instead. An async reader stages training.stream_read_ahead layers "
-                "in pinned host RAM rather than holding the base resident. It is "
-                "slower than the RAM tier — measured ~2.2x its step time with the "
+                "in host RAM (page-locked where the box allows) rather than "
+                "holding the base resident. It is "
+                "slower than the RAM tier — measured 1.9-2.3x its step time with the "
                 "store fully cached, on one box "
                 "(benchmarks/gate-927-async-nvme-source.md); a store larger than "
                 "RAM has no RAM-tier comparison, which is what makes this a "

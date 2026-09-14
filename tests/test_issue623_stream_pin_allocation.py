@@ -480,6 +480,32 @@ class TestTheReadAheadDepthIsWiredAndVisible:
         assert "nothing held resident" not in plain, plain
         assert "staged by an async reader" in plain, plain
 
+    def test_the_forced_disk_note_says_why_and_does_not_over_promise_pinning(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The forced-tier note was the one rewritten string with NO test: a
+        repo-wide grep for "not because RAM was short" found nothing, while its
+        two siblings are pinned by `test_v07203.py::
+        test_the_fallback_says_what_it_costs` and by the case above.
+
+        It also asserted the staging is "in pinned host RAM" unconditionally,
+        where `pin = plan.pinned and on_cuda` can be False and `_build_source`
+        falls back to pageable — the ready line then reports the truth, one
+        line under a note that has already claimed otherwise.
+        """
+        _captured, panel = self._drive_disk(tmp_path, monkeypatch)
+        plain = _plain(panel)
+        # WHY this tier: reached by the flag, not by RAM pressure. Without it
+        # the panel reads identically to a genuine fallback.
+        assert "not because RAM was short" in plain, plain
+        assert "stream_source='disk'" in plain, plain
+        # What it costs, with a source — the same contract as the auto note.
+        assert "slower than the RAM tier" in plain, plain
+        assert "gate-927-async-nvme-source.md" in plain, plain
+        # And the honest pinning wording.
+        assert "page-locked where the box allows" in plain, plain
+        assert "in pinned host RAM" not in plain, plain
+
     def test_a_forced_disk_run_still_pins_its_staging(
         self, tmp_path, monkeypatch
     ) -> None:

@@ -848,9 +848,10 @@ class StreamingSetupMixin:
                 + (
                     "streaming from disk because stream_source='disk' was set, "
                     "not because RAM was short. An async reader stages "
-                    "training.stream_read_ahead layers in pinned host RAM rather "
-                    "than holding the base resident, and is slower than the RAM "
-                    "tier it is being used instead of — measured ~2.2x its step "
+                    "training.stream_read_ahead layers in host RAM (page-locked "
+                    "where the box allows) rather than holding the base "
+                    "resident, and is slower than the RAM "
+                    "tier it is being used instead of — measured 1.9-2.3x its step "
                     "time with the store fully cached, on one box "
                     "(benchmarks/gate-927-async-nvme-source.md).",
                 ),

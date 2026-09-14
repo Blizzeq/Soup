@@ -2453,13 +2453,22 @@ class TestAutoTierFallback:
         assert "stream_source='ram'" in joined, joined
         assert "slower than the RAM tier" in joined, joined
         # A bare claim of "slower" is what this test exists to prevent: the
-        # note must carry a figure and say where it came from.
-        assert "2.2x" in joined, joined
+        # note must carry a figure and say where it came from. The figure is a
+        # RANGE since the record's revision pass: the warm gap is 1.03-1.20x
+        # against the source this replaces and 1.90-2.26x against the RAM tier
+        # this note compares to, depending on run order — a single "2.2x"
+        # published one order's number as if it were the measurement.
+        assert "1.9-2.3x" in joined, joined
         assert "gate-927-async-nvme-source.md" in joined, joined
         # ...and it must NOT go back to promising nothing is held: the reader
-        # stages read_ahead layers in pinned host RAM.
+        # stages read_ahead layers in host RAM.
         assert "unmeasured" not in joined, joined
         assert "Nothing is held resident" not in joined, joined
+        # Nor over-promise the other way: `pin=plan.pinned and on_cuda` can be
+        # False and the staging then falls back to pageable, so the note says
+        # "where the box allows" rather than asserting it is page-locked.
+        assert "page-locked where the box allows" in joined, joined
+        assert "in pinned host RAM" not in joined, joined
 
 
 def _write_tiny_tokenizer(weights_dir):
