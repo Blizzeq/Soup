@@ -762,12 +762,18 @@ class StreamingSetupMixin:
             # before the runtime announces it is streaming from disk. Every
             # field that describes the RAM store is corrected with it, so no
             # consumer can read a stale value.
+            # `pinned` is deliberately NOT zeroed with them. It described the
+            # RAM store, but `pin=plan.pinned and on_cuda` below now also
+            # decides whether the disk tier's host STAGING is page-locked
+            # (#927). Zeroing it here would stage pageable for a run that
+            # reached the disk tier via `stream_source: disk` and pinned for one
+            # that reached the same tier via `auto` — one tier, two behaviours,
+            # chosen by the spelling.
             plan = replace(
                 plan,
                 tier=tier,
                 store_bytes=0,
                 large_store_bytes=0,
-                pinned=False,
                 notes=plan.notes
                 + (
                     "streaming from disk because stream_source='disk' was set, "
@@ -841,12 +847,16 @@ class StreamingSetupMixin:
             device=self.device,
             dtype=dtype,
             buffers=tcfg.stream_buffers,
+            # #927: the depth the async reader stages to on the disk tier.
+            # Ignored on the RAM tier, which holds every layer and reads
+            # nothing ahead.
+            read_ahead=tcfg.stream_read_ahead,
             pin=plan.pinned and on_cuda,
-            # #366: on the RAM tier stream_pin=true refuses rather than silently
-            # falling back to a pageable store; on the disk tier the runtime
-            # announces that pinning is inapplicable (no RAM store to lock); on
-            # non-CUDA targets the notice above covers it. require_pin only carries
-            # the CUDA RAM-tier refusal, so it is gated on a real CUDA device.
+            # #366: stream_pin=true refuses rather than silently falling back to
+            # pageable memory — on the RAM tier that is the store, and since
+            # #927 on the disk tier it is the reader's host staging. On
+            # non-CUDA targets the notice above covers it, so require_pin is
+            # gated on a real CUDA device.
             require_pin=(tcfg.stream_pin is True) and on_cuda,
             seed=tcfg.seed if getattr(tcfg, "seed", None) is not None else 0,
             trust_remote_code=self._trust_remote_code,
@@ -868,9 +878,14 @@ class StreamingSetupMixin:
                 f"{'pinned' if stats['pinned'] else 'pageable'} RAM store"
             )
         else:
+            # Not "nothing held resident": the async reader stages `read_ahead`
+            # layers in host memory, so say how deep and how much (#927).
             source_line = (
                 f"streamed from DISK ({stats['disk_bytes'] / 1e9:.2f} GB on an "
-                f"NVMe volume, nothing held resident)"
+                f"NVMe volume) by an async reader, "
+                f"read_ahead={stats['read_ahead']}, "
+                f"{stats['store_bytes'] / 1e6:.0f} MB "
+                f"{'pinned' if stats['pinned'] else 'pageable'} host staging"
             )
         large_runtime_buffer = stats.get("large_buffer_bytes", 0)
         decoder_buffers = stats["buffer_bytes"] - large_runtime_buffer

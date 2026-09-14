@@ -1882,15 +1882,47 @@ class TestDiskTier:
         ]
         assert grads and sum(grads) > 0.0
 
-    def test_nothing_is_held_resident(self, tmp_path):
-        """The point of the tier. ``store_bytes`` is what the RAM tier would
-        have pinned; on disk it must be zero, with the size reported separately
-        so the operator still sees what the model costs."""
+    def test_only_the_readers_staging_is_held_resident(self, tmp_path):
+        """The point of the tier, restated honestly for #927.
+
+        ``store_bytes`` was zero while the tier allocated a fresh tensor per
+        call. The async reader stages ``read_ahead`` layers in host memory, so
+        zero is now a lie — the number an operator needs is that staging, and
+        what makes it the disk tier rather than the RAM tier is that it is a
+        few layers rather than the whole model.
+        """
         disk, runtime, _ = _tiny_stream(tmp_path, name="d1", tier="disk")
         stats = runtime.stats()
         assert stats["tier"] == "disk"
-        assert stats["store_bytes"] == 0
         assert stats["disk_bytes"] > 0
+        assert stats["store_bytes"] == runtime.source.nbytes
+        assert 0 < stats["store_bytes"] < stats["disk_bytes"], (
+            "the staging must be real and must be a fraction of the model — "
+            f"{stats['store_bytes']} of {stats['disk_bytes']} bytes"
+        )
+
+    def test_stats_reports_the_readers_real_depth_not_a_constant(self, tmp_path):
+        """#927 / #748: the depth must be OBSERVABLE, and observed from the
+        source rather than restated.
+
+        A non-default depth is what makes this discriminating — a `stats()`
+        that hardcoded the default would satisfy any assertion taken at the
+        default, and that exact mutant survived the first round of tests here.
+        The RAM-tier control is the other half: `RamSource` reads nothing
+        ahead, so a number there would be invented.
+        """
+        _, runtime, _ = _tiny_stream(
+            tmp_path, name="d1", tier="disk", read_ahead=3
+        )
+        stats = runtime.stats()
+        assert stats["read_ahead"] == 3
+        assert stats["read_ahead"] == runtime.source.read_ahead
+
+        _, ram_rt, _ = _tiny_stream(tmp_path, name="r1", tier="ram")
+        assert ram_rt.stats()["read_ahead"] is None, (
+            "the RAM tier has no reader, so its depth must be absent rather "
+            "than a plausible-looking default"
+        )
 
     def test_disk_and_ram_accounting_agree(self, tmp_path):
         """A disk tier that reported a different model size than the RAM tier
@@ -1935,17 +1967,28 @@ class TestDiskTier:
             DiskSource(shards, 3, spec)
         assert "layer_002" in str(excinfo.value) or "No such" in str(excinfo.value)
 
-    def test_runtime_close_releases_the_shard_handles(self, tmp_path):
-        """The disk tier holds ONE open handle per decoder layer — 80+ on a large
-        model. Without an explicit release they live until the process exits and
-        leak across back-to-back runs in one process (`soup sweep`, the web UI)."""
-        from soup_cli.utils.layer_stream_runtime import DiskSource
+    def test_runtime_close_stops_the_reader_thread_and_frees_the_staging(
+        self, tmp_path
+    ):
+        """What close() releases on this tier changed with #927.
+
+        There are no shard handles to leak any more — ``AsyncDiskSource`` opens
+        each shard per read precisely because a mapping charges Windows commit
+        for the whole file (#926). What it now owns is a background THREAD and
+        its host staging buffers, which on a pinned run are page-locked. A run
+        that finishes without closing leaves both alive for the life of the
+        process, which is what back-to-back runs in one process (`soup sweep`,
+        the web UI) do.
+        """
+        from soup_cli.utils.async_disk_source import AsyncDiskSource
 
         _, runtime, _ = _tiny_stream(tmp_path, name="d1", tier="disk")
-        assert isinstance(runtime.source, DiskSource)
-        assert runtime.source._handles, "no shard handles were opened at all"
+        assert isinstance(runtime.source, AsyncDiskSource)
+        assert runtime.source._thread.is_alive(), "the reader never started"
+        assert runtime.source._slots, "no staging was allocated at all"
         runtime.close()
-        assert runtime.source._handles == []
+        assert not runtime.source._thread.is_alive()
+        assert runtime.source._slots == []
         assert runtime.hook is None, "the prefetch hook was left attached"
         runtime.close()  # idempotent
 
@@ -2190,9 +2233,19 @@ class TestAutoTierFallback:
         assert wrapper._stream_runtime.tier == "ram"
 
     def test_auto_falls_back_to_disk_when_it_does_not(self, tmp_path, monkeypatch):
+        """``store_bytes`` was zero here for the same reason it was zero in
+        ``TestDiskTier``: the tier held nothing. Since #927 it holds the async
+        reader's host staging, so the claim that distinguishes the tiers is no
+        longer "nothing" but "a few layers rather than the whole model"."""
         wrapper = self._run(tmp_path, monkeypatch, free_ram=1000, stream_source="auto")
-        assert wrapper._stream_runtime.tier == "disk"
-        assert wrapper._stream_runtime.stats()["store_bytes"] == 0
+        runtime = wrapper._stream_runtime
+        stats = runtime.stats()
+        assert runtime.tier == "disk"
+        assert stats["store_bytes"] == runtime.source.nbytes
+        assert 0 < stats["store_bytes"] < stats["disk_bytes"], (
+            "the staging must be real and a fraction of the model — "
+            f"{stats['store_bytes']} of {stats['disk_bytes']} bytes"
+        )
 
     def test_ram_refuses_instead_of_falling_back(self, tmp_path, monkeypatch):
         """`auto` trades speed to complete the run; `ram` is how an operator says
@@ -2573,7 +2626,7 @@ def _advice(**kw):
 # ==========================================================================
 def _tiny_stream(
     tmp_path, name="shards", seed=3, n_layers=3, device="cpu", tier="ram",
-    quant="none", pin=False, require_pin=False,
+    quant="none", pin=False, require_pin=False, read_ahead=None,
 ):
     """A streamed model over a real (tiny) on-disk Llama checkpoint."""
     import torch
@@ -2625,10 +2678,13 @@ def _tiny_stream(
         str(weights), shards, dtype="float32", arch="llama", quant=quant,
         quant_suffixes=suffixes, quant_device="cpu",
     )
+    # Omitted rather than defaulted, so the harness exercises the production
+    # default unless a test deliberately asks for another depth (#927).
+    depth = {} if read_ahead is None else {"read_ahead": read_ahead}
     model, runtime = build_streamed_model(
         model_id=str(weights), shard_dir=shards, index=index, lora_config=lora,
         device=device, dtype="float32", buffers=2, pin=pin, seed=seed,
-        tier=tier, quant=quant, require_pin=require_pin,
+        tier=tier, quant=quant, require_pin=require_pin, **depth,
     )
     return model, runtime, str(weights)
 

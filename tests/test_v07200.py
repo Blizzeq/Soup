@@ -2540,7 +2540,11 @@ _REFUSAL_SPEC = {"weight": ((_REFUSAL_HIDDEN, _REFUSAL_HIDDEN), "bfloat16")}
 #: 1.073 GB and 64 layers is 2.147 GB.
 _REFUSAL_STORE_SIZES = ((32, "1.07 GB"), (64, "2.15 GB"))
 #: The distinguishing phrase of the disk-tier "pinning is inapplicable here"
-#: announcement, which must fire on an explicit request and stay silent without.
+#: announcement, DELETED in #927. It was true while the disk tier allocated a
+#: fresh tensor per call and had nothing to page-lock; the async reader stages
+#: into reusable host buffers, which pin exactly as the RAM store does. Kept so
+#: the rewritten cases can assert it is ABSENT — a re-introduced explanation
+#: would otherwise read as a harmless extra line.
 _DISK_TIER_INAPPLICABLE_TEXT = "Pinning does not apply"
 
 
@@ -2618,13 +2622,20 @@ class TestStreamPinRuntimeRefusal:
         assert "0.10 GB" not in message, message
 
 
-class TestDiskTierAnnouncesInapplicablePinning:
-    """#366 round-3: on the disk tier the base does not fit in RAM, so there is
-    no RAM store to page-lock — pinning is INAPPLICABLE rather than
-    unsatisfiable, and the run proceeds. That is a decision, not a silence, so
-    the announcement has to exist; deleting the whole block previously left the
-    suite green. `require_pin` is gated on a real CUDA device upstream, so this
-    drives `_build_source` directly to reach the branch without a GPU."""
+class TestDiskTierPinsItsStagingOrRefuses:
+    """#927: the disk tier now pins the same way the RAM tier does.
+
+    It used to ANNOUNCE that pinning was inapplicable, which was true while the
+    tier allocated a fresh tensor per call — there was no host buffer to
+    page-lock. ``AsyncDiskSource`` reads ahead into REUSABLE host staging, and
+    pinning that staging is what lets the host-to-device copy overlap compute
+    at all. So an explicit ``training.stream_pin`` is honoured or refused here,
+    never explained away; and because the depth decides how much is page-locked,
+    the refusal offers a remedy the RAM tier cannot.
+
+    ``require_pin`` is gated on a real CUDA device upstream, so this drives
+    `_build_source` directly to reach the branch without a GPU.
+    """
 
     _SPEC = {"weight": ((2, 2), "float32")}
 
@@ -2635,51 +2646,130 @@ class TestDiskTierAnnouncesInapplicablePinning:
         def print(self, *args, **_kwargs):
             self.messages.append(" ".join(str(a) for a in args))
 
-    def _build_on_disk(self, monkeypatch, *, require_pin):
+    def _patch_async_source(self, monkeypatch, *, fails_when_pinned: bool):
+        """Mirrors `_patch_ramsource_to_fail_pinning` above, one tier down.
+
+        Patched on `soup_cli.utils.async_disk_source` because `_build_source`
+        imports the class lazily — that module attribute is the name the import
+        resolves, so patching the runtime module would not be seen.
+        """
+        import soup_cli.utils.async_disk_source as ads
+
+        opened = []
+
+        class _StubAsyncDisk:
+            def __init__(self, shard_dir, n_layers, spec, **kwargs):
+                opened.append(kwargs)
+                if kwargs.get("pin") and fails_when_pinned:
+                    raise RuntimeError("CUDA error: cannot allocate pinned memory")
+                self.pinned = bool(kwargs.get("pin"))
+                self.read_ahead = kwargs.get("read_ahead")
+                self.nbytes = 16
+                self.disk_bytes = 64
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(ads, "AsyncDiskSource", _StubAsyncDisk)
+        return opened
+
+    def _build_on_disk(self, monkeypatch, *, require_pin, pin=True, fails=True,
+                       read_ahead=4):
         import soup_cli.utils.layer_stream_runtime as rt
 
-        class _StubDisk:
-            def __init__(self, shard_dir, n_layers, spec):
-                self.nbytes = 0
-
-        monkeypatch.setattr(rt, "DiskSource", _StubDisk)
+        opened = self._patch_async_source(monkeypatch, fails_when_pinned=fails)
         console = self._RecordingConsole()
-        _source, pinned = rt._build_source(
-            "d", 1, self._SPEC, True, console, "disk", require_pin=require_pin
+        source, pinned = rt._build_source(
+            "d", 1, self._SPEC, pin, console, "disk",
+            require_pin=require_pin, read_ahead=read_ahead,
+        )
+        return source, pinned, console.messages, opened
+
+    def test_an_explicit_request_that_cannot_be_met_refuses(self, monkeypatch):
+        """The RAM tier's contract, now the disk tier's: stream_pin=true means
+        refuse, not degrade. The remedy list must include the one that is
+        specific to this tier — the read-ahead depth IS the multiplier on how
+        much host memory gets page-locked."""
+        with pytest.raises(RuntimeError) as excinfo:
+            self._build_on_disk(monkeypatch, require_pin=True)
+        message = str(excinfo.value)
+        assert "training.stream_pin" in message, message
+        assert "training.stream_read_ahead" in message, message
+        assert "4" in message, ("the refusal must quote the depth it could not "
+                               f"pin, not just name the field: {message}")
+
+    def test_without_the_flag_it_falls_back_loudly_and_retries_pageable(
+        self, monkeypatch
+    ):
+        """Refusing here would brick the very runs the disk tier exists for, so
+        the default is a fallback — but a silent one would spend the whole
+        overlap margin without saying so."""
+        source, pinned, messages, opened = self._build_on_disk(
+            monkeypatch, require_pin=False
         )
         assert pinned is False
-        return console.messages
+        assert source.pinned is False
+        assert [kwargs["pin"] for kwargs in opened] == [True, False], (
+            "the fallback must RETRY with pin=False, not hand back the object "
+            f"that failed: {opened}"
+        )
+        assert len(messages) == 1, messages
+        # The measured figures, not the punctuation between them: the RAM
+        # branch's fallback spells it "drops from ~97% to ~79%" and its refusal
+        # "~97% -> ~79%", and this must stay readable beside both.
+        assert "~97%" in messages[0] and "~79%" in messages[0], messages[0]
+        assert "training.stream_read_ahead" in messages[0], messages[0]
 
-    def test_an_explicit_request_is_announced_not_dropped(self, monkeypatch):
-        messages = self._build_on_disk(monkeypatch, require_pin=True)
-        assert any(_DISK_TIER_INAPPLICABLE_TEXT in m for m in messages), messages
-
-    def test_nothing_is_announced_without_a_request(self, monkeypatch):
-        """Control: the announcement answers a request, so an ordinary disk-tier
-        run must not grow a line about a flag nobody set. Without this half, a
-        mutant that always printed it would pass."""
-        messages = self._build_on_disk(monkeypatch, require_pin=False)
+    def test_a_successful_pin_says_nothing(self, monkeypatch):
+        """Control: the RAM tier keeps silent when its default works, and so
+        must this one. Without this half, a mutant that always printed the
+        fallback warning would pass the case above."""
+        source, pinned, messages, opened = self._build_on_disk(
+            monkeypatch, require_pin=False, fails=False
+        )
+        assert pinned is True
+        assert source.pinned is True
+        assert [kwargs["pin"] for kwargs in opened] == [True]
         assert messages == []
 
-    def test_it_still_reaches_the_log_without_a_console(self, monkeypatch, caplog):
+    def test_an_honoured_request_never_says_pinning_does_not_apply(
+        self, monkeypatch
+    ):
+        """The deleted announcement was FALSE once staging existed. A run that
+        asked for pinning and got it must not be told it was inapplicable."""
+        _source, pinned, messages, _opened = self._build_on_disk(
+            monkeypatch, require_pin=True, fails=False
+        )
+        assert pinned is True
+        assert not any(_DISK_TIER_INAPPLICABLE_TEXT in m for m in messages), messages
+        assert messages == []
+
+    def test_the_depth_reaches_the_source(self, monkeypatch):
+        """#748: `training.stream_read_ahead` is read by nothing unless it lands
+        on the constructor. Asserted on the value, not on presence."""
+        source, _pinned, _messages, opened = self._build_on_disk(
+            monkeypatch, require_pin=False, fails=False, read_ahead=7
+        )
+        assert opened[0]["read_ahead"] == 7
+        assert source.read_ahead == 7
+
+    def test_the_fallback_still_reaches_the_log_without_a_console(
+        self, monkeypatch, caplog
+    ):
         """`_build_source` is also called with `console=None` (the runtime does
         not always have one). The decision must still be recorded there, or the
-        carve-out is silent on exactly the path with no screen to print to."""
+        degradation is silent on exactly the path with no screen to print to."""
         import logging
 
         import soup_cli.utils.layer_stream_runtime as rt
 
-        class _StubDisk:
-            def __init__(self, shard_dir, n_layers, spec):
-                self.nbytes = 0
-
-        monkeypatch.setattr(rt, "DiskSource", _StubDisk)
+        self._patch_async_source(monkeypatch, fails_when_pinned=True)
         with caplog.at_level(logging.WARNING):
             _source, pinned = rt._build_source(
-                "d", 1, self._SPEC, True, None, "disk", require_pin=True
+                "d", 1, self._SPEC, True, None, "disk", require_pin=False
             )
         assert pinned is False
-        assert _DISK_TIER_INAPPLICABLE_TEXT in caplog.text, caplog.text
+        assert "~97%" in caplog.text and "~79%" in caplog.text, caplog.text
 
 
 class TestCachedIndexInvalidation:

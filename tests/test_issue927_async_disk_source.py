@@ -929,3 +929,97 @@ class TestDepthOnTheShapeProductionActuallyHas:
             )
         finally:
             source.close()
+
+
+class TestTheSettingReachesTheSource:
+    """#748's lesson: a field read by nothing is the defect, not the feature.
+
+    ``training.stream_read_ahead`` is validated, documented and bounded — and
+    until the disk tier actually constructs ``AsyncDiskSource`` with it, setting
+    it changes the config fingerprint and nothing else.
+    """
+
+    def test_build_source_returns_the_async_source_on_the_disk_tier(self, tmp_path):
+        from soup_cli.utils.layer_stream_runtime import _build_source
+
+        shard_dir = _shards(tmp_path)
+        source, pinned = _build_source(
+            shard_dir, N_LAYERS, _spec(shard_dir), False, None, "disk", read_ahead=3
+        )
+        try:
+            assert isinstance(source, AsyncDiskSource)
+            assert source.read_ahead == 3
+            # pin=False was asked for, so the staging is pageable and the flag
+            # — "the host-side source memory is page-locked" — says so.
+            assert pinned is False
+        finally:
+            source.close()
+
+    @pytest.mark.skipif(_NO_CUDA, reason="pinned staging needs a CUDA device")
+    def test_the_disk_tier_pins_its_staging_when_asked(self, tmp_path):
+        """The flag means page-locked on BOTH tiers, so the disk tier must be
+        able to return True. Before pinned staging existed it was hardcoded
+        False, which is now a lie rather than a simplification."""
+        from soup_cli.utils.layer_stream_runtime import _build_source
+
+        shard_dir = _shards(tmp_path)
+        source, pinned = _build_source(
+            shard_dir, N_LAYERS, _spec(shard_dir), True, None, "disk", read_ahead=2
+        )
+        try:
+            assert source.pinned is True
+            assert pinned is True
+        finally:
+            source.close()
+
+    def test_the_ram_tier_is_untouched(self, tmp_path):
+        from soup_cli.utils.layer_stream_runtime import _build_source
+
+        shard_dir = _shards(tmp_path)
+        source, _ = _build_source(
+            shard_dir, N_LAYERS, _spec(shard_dir), False, None, "ram"
+        )
+        assert isinstance(source, RamSource)
+
+    def test_every_stream_setup_call_site_passes_read_ahead(self):
+        """Matched on the CALLEE NAME, not on "any call with a buffers= keyword":
+        two of the three ``buffers=`` call sites in that file are
+        ``build_stream_plan`` (the pure planner) and ``estimate_stream_peak_vram``
+        (host staging is not VRAM), neither of which takes a read_ahead.
+        """
+        import ast
+
+        path = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "soup_cli"
+            / "trainer"
+            / "stream_setup.py"
+        )
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+
+        def _callee(node: ast.Call) -> str:
+            func = node.func
+            if isinstance(func, ast.Name):
+                return func.id
+            if isinstance(func, ast.Attribute):
+                return func.attr
+            return ""
+
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and _callee(node) == "build_streamed_model"
+        ]
+        # Positive control: a scan that finds nothing must fail, not pass.
+        assert calls, (
+            "no build_streamed_model call site found in stream_setup.py — the "
+            "scan cannot see the real one, so it proves nothing"
+        )
+        for call in calls:
+            names = {kw.arg for kw in call.keywords}
+            assert "read_ahead" in names, (
+                f"the build_streamed_model call at line {call.lineno} passes "
+                f"buffers but not read_ahead, so training.stream_read_ahead "
+                f"never reaches the source"
+            )

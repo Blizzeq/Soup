@@ -24,6 +24,11 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, FrozenSet, Iterator, Mapping, Optional, Sequence, Tuple, Union
 
+# Stdlib-only at import (it defers torch to its own constructor), so the
+# default is safe to read at module scope. ``AsyncDiskSource`` itself is
+# imported inside ``_build_source``, where torch is already unavoidable.
+from soup_cli.utils.async_disk_source import DEFAULT_STREAM_READ_AHEAD
+
 logger = logging.getLogger(__name__)
 
 #: Storage dtypes a shard may hold. ``uint8`` is not a *base* dtype — it is what
@@ -1908,9 +1913,12 @@ class StreamRuntime:
     def close(self) -> None:
         """Release the weight source and detach the prefetch hook.
 
-        The disk tier holds one open shard handle per decoder layer, so a run
-        that finishes without closing leaks 80+ descriptors on a large model.
-        A no-op for the RAM tier, which owns no handles.
+        On the disk tier this stops the reader THREAD and frees its host
+        staging buffers, which on a pinned run are page-locked and so cost the
+        box until they are released. It holds no shard handles to leak:
+        ``AsyncDiskSource`` opens each shard per read precisely because a
+        mapping charges Windows commit for the file's whole size (#926).
+        A no-op for the RAM tier, which owns neither a thread nor handles.
         """
         source_close = getattr(self.source, "close", None)
         if callable(source_close):
@@ -1932,6 +1940,10 @@ class StreamRuntime:
             "store_bytes": self.source.nbytes,
             "pinned": self.pinned,
             "tier": self.tier,
+            # The reader's depth, where there is a reader. None on the RAM
+            # tier — RamSource holds every layer and reads nothing ahead, so a
+            # number there would be an invented one.
+            "read_ahead": getattr(self.source, "read_ahead", None),
             "disk_bytes": getattr(self.source, "disk_bytes", 0),
             "layer_loads": self.pool.loads,
             "large_loads": getattr(self.large_pool, "loads", 0),
@@ -1981,6 +1993,7 @@ def install_streaming(
     console: Any = None,
     codes: Optional[Mapping[str, Any]] = None,
     tier: str = "ram",
+    read_ahead: int = DEFAULT_STREAM_READ_AHEAD,
 ) -> StreamRuntime:
     """Wrap every decoder layer and wire the buffer pool + prefetch scheduler."""
     import torch
@@ -2097,6 +2110,7 @@ def install_streaming(
         tier,
         require_pin=require_pin,
         shard_paths=source_paths,
+        read_ahead=read_ahead,
     )
     pool = LayerBufferPool(
         spec,
@@ -2211,6 +2225,7 @@ def _build_source(
     tier="ram",
     require_pin=False,
     shard_paths=None,
+    read_ahead=DEFAULT_STREAM_READ_AHEAD,
 ):
     """Build the weight source for the chosen tier.
 
@@ -2225,26 +2240,67 @@ def _build_source(
     throughput margin pinning exists to provide — is exactly the outcome the flag
     exists to prevent.
 
-    On the DISK tier pinning is not *unsatisfiable*, it is *inapplicable*: the
-    base does not fit in RAM, so weights stream directly from NVMe and there is
-    no RAM store to page-lock. Refusing here would brick the very runs the disk
-    tier exists for, so ``require_pin`` proceeds — but it is announced, never
-    dropped in silence (#366 review).
+    The DISK tier now behaves the same way, for the same reason. It used to
+    *announce* that pinning was inapplicable — true while the base streamed from
+    NVMe into a freshly allocated tensor per call, with nothing to page-lock.
+    ``AsyncDiskSource`` reads ahead into reusable HOST STAGING (#927), and that
+    staging is exactly the kind of memory pinning exists for: out of pageable
+    memory the host-to-device copy is synchronous and the reader cannot overlap
+    with compute. So an explicit ``training.stream_pin`` is honoured or refused
+    here, never explained away.
+
+    ``read_ahead`` (``training.stream_read_ahead``) is the reader's depth and
+    therefore the multiplier on how much host memory is page-locked, which makes
+    lowering it a remedy the RAM tier cannot offer.
+
+    The second element of the returned tuple means the same thing on both tiers:
+    the host-side source memory is page-locked.
     """
     source_kwargs = {} if shard_paths is None else {"shard_paths": shard_paths}
     if tier == "disk":
-        if require_pin:
-            message = (
-                "training.stream_pin=true, but this run is on the disk tier: the "
-                "base does not fit in RAM, so weights stream directly from NVMe "
-                "and there is no RAM store to page-lock. Pinning does not apply "
-                "here; proceeding without it."
-            )
-            if console is not None:
-                console.print(f"[yellow]{message}[/]")
+        from soup_cli.utils.async_disk_source import AsyncDiskSource
+
+        open_kwargs = dict(read_ahead=read_ahead, **source_kwargs)
+        if pin:
+            try:
+                source = AsyncDiskSource(
+                    shard_dir, n_layers, spec, pin=True, **open_kwargs
+                )
+            except (RuntimeError, MemoryError) as exc:
+                # Staging is allocated before the reader thread starts, so a
+                # constructor that raised here owns no thread and no buffers —
+                # there is nothing to close before retrying.
+                if require_pin:
+                    raise RuntimeError(
+                        "training.stream_pin=true but this box could not "
+                        "page-lock the disk tier's host staging "
+                        f"({type(exc).__name__}). The staging is "
+                        f"training.stream_read_ahead={read_ahead} layers deep "
+                        "per distinct layer shape, so that depth is what decides "
+                        "how much gets page-locked. Refusing rather than silently "
+                        "degrading to pageable staging, which makes host-to-device "
+                        "copies synchronous and costs the ~97% -> ~79% "
+                        "GPU-utilisation overlap pinning buys. Lower "
+                        "training.stream_read_ahead, free RAM, or unset "
+                        "training.stream_pin to allow the pageable fallback."
+                    ) from exc
+                message = (
+                    "layer streaming could not page-lock the disk tier's host "
+                    f"staging ({type(exc).__name__}); falling back to PAGEABLE "
+                    "staging. Host-to-device copies become synchronous, which "
+                    "costs overlap — measured GPU utilisation drops from ~97% to "
+                    "~79%. Lower training.stream_read_ahead (its depth is what "
+                    "decides how much is page-locked) or free RAM to keep the "
+                    "pinned staging."
+                )
+                if console is not None:
+                    console.print(f"[yellow]{message}[/]")
+                else:
+                    logger.warning(message)
             else:
-                logger.warning(message)
-        return DiskSource(shard_dir, n_layers, spec, **source_kwargs), False
+                return source, source.pinned
+        source = AsyncDiskSource(shard_dir, n_layers, spec, pin=False, **open_kwargs)
+        return source, source.pinned
     if not pin:
         return RamSource(shard_dir, n_layers, spec, pin=False, **source_kwargs), False
     try:
@@ -2316,6 +2372,7 @@ def build_streamed_model(
     quant: str = "none",
     double_quant: bool = True,
     tier: str = "ram",
+    read_ahead: int = DEFAULT_STREAM_READ_AHEAD,
     weights_dir: Optional[str] = None,
     ngram_source: str = "disk",
 ) -> Tuple[Any, StreamRuntime]:
@@ -2367,6 +2424,7 @@ def build_streamed_model(
             console=console,
             codes=extras.codes,
             tier=tier,
+            read_ahead=read_ahead,
         )
     except BaseException:
         for external in external_sources:
