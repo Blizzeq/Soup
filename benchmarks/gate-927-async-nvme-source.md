@@ -26,12 +26,21 @@ benchmarks/results/probe-rtx5070/.
 
 **Status: MEASURED, 2026-09-14, with one negative result and one confound that
 changed the headline.** The cold disk tier got **2.1x–3.1x faster** depending on
-which position-matched pair you take, and the win comes with the GPU leaving
-idle clocks for the first time. **Warm, with the whole store in the page cache,
-the async source is 1.19x SLOWER than the one it replaces** — measured against a
-same-day control, not against a published number from another session. What
-looked at first like a read-ahead *depth* effect turned out to be the page cache
-warming across blocks, and is published as the ordering result it is.
+which position-matched pair you take. **Warm, with the whole store in the page
+cache, the async source is SLOWER than the one it replaces — 1.20x in the first
+run order and 1.03x with that order reversed** — measured against a same-day
+control, not against a published number from another session. What looked at
+first like a read-ahead *depth* effect is consistent with the page cache warming
+across blocks, and is published as the ordering result it is.
+
+**Revised 2026-09-14 15:30–16:01, after a whole-branch review.** Six things
+changed and every one of them is a claim this record made that its own JSON did
+not support: a GPU-clock cell printed as `—`, a missing spread on the row that
+anchors the best ratio, a "roughly half the step" that contradicted two other
+sections, an undisclosed run order under the warm regression, a §8 JSON produced
+by a scratchpad copy of the harness rather than the committed one, and no table
+naming its source file. The corrections are dated and inline; nothing was
+deleted. §8 was re-measured and the warm trio re-run in reverse order.
 
 Unit convention: **decimal GB**, matching the other records.
 
@@ -122,6 +131,13 @@ throughput evidence: another session's full pytest suite was running throughout
 The first row could not have been produced before change (b): the disk tier
 reports **pinned** staging.
 
+**These three figures and every `store` line quoted in this record were read off
+the run logs; no JSON was retained for them** (`--out` was written and then
+overwritten by the next verification arm). They are labelled functional
+verification and are never cited as throughput, so this is a note rather than a
+defect — but every other table here names a committed file and these cannot.
+(Added 2026-09-14 15:30.)
+
 ---
 
 ## 2. The cold headline
@@ -132,12 +148,21 @@ cache can hold it. Batch 1 × seq 512, 6 timed steps after 2 warm-up,
 **uninstrumented** (§4 says why that qualifier is load-bearing). Sharding was a
 cache hit in every block (`shard 0.0 s`), so every block read the same store.
 
-| block | order | source | step | tok/s | source rate | GPU clock |
-|---|---|---|---|---|---|---|
-| control, sync `DiskSource` | 2nd | pageable, no reader | **100.35 s** (89.6–105.7) | 5.10 | 0.701 GB/s | 180 → 180 MHz |
-| async, `read_ahead 2` | 1st | 1.957 GB pinned staging | **48.09 s** (43.3–52.5) | 10.65 | 1.464 GB/s | 1792 → 2355 MHz |
-| control, sync `DiskSource` | 6th | pageable, no reader | **92.25 s** | 5.55 | 0.763 GB/s | — |
-| async, `read_ahead 2` (repeat) | 5th | 1.957 GB pinned staging | **30.28 s** (29.1–34.0) | 16.91 | 2.324 GB/s | 180 → 705 MHz |
+| block | order | source | step | tok/s | source rate | GPU clock | JSON |
+|---|---|---|---|---|---|---|---|
+| control, sync `DiskSource` | 2nd | pageable, no reader | **100.35 s** (89.6–105.7) | 5.10 | 0.701 GB/s | 180 → 180 MHz | `control_sync_cold_synth70b_nf4.json` |
+| async, `read_ahead 2` | 1st | 1.957 GB pinned staging | **48.09 s** (43.3–52.5) | 10.65 | 1.464 GB/s | 1792 → 2355 MHz | `async_cold_synth70b_nf4.json` |
+| control, sync `DiskSource` | 6th | pageable, no reader | **92.25 s** (85.4–101.8) | 5.55 | 0.763 GB/s | 1417 → 210 MHz | `control_sync_cold_synth70b_nf4_last.json` |
+| async, `read_ahead 2` (repeat) | 5th | 1.957 GB pinned staging | **30.28 s** (29.1–34.0) | 16.91 | 2.324 GB/s | 180 → 705 MHz | `async_cold_synth70b_nf4_ra2_repeat.json` |
+
+**Correction, 2026-09-14 15:30.** The third row printed `—` for its GPU clock
+and carried no spread, and it is the row the 3.05x rests on. Both were in its
+JSON the whole time: `1417 → 210 MHz`, and 85.42–101.75 s. They are filled in
+above. The spread is wide — wider than the async repeat's 29.1–34.0 — which
+*strengthens* the finding rather than weakening it, and a reader could not see
+that. Every table in this record now names the JSON it came from, for the same
+reason: nine files, two near-identically named, and the mapping was previously
+reconstructible only from `started` timestamps.
 
 Bytes moved is **70.38 GB per step** in every row (157 decoder loads + 2 large),
 and peak VRAM is **4.378 GB allocated / 4.80 reserved** in every row — streaming
@@ -156,16 +181,47 @@ async source moved 48.09 → 30.28 s (**1.59x**). That is consistent with the
 shipped source being bound by per-page synchronous faults *on the compute
 thread*, where even a cache hit costs a fault and the GPU still waits.
 
-**Finding 2b — the GPU stops idling.** The control's SM clock is 180 → 180 MHz:
-it never leaves idle across a 10-minute block, which is §17's signature
-("210 MHz — the GPU is idling between layers"). The async blocks reach
-1417–2355 MHz.
+**Finding 2b — the GPU is at idle clocks in one control block and not in any
+async block, on two samples per block.** The harness reads `clocks.sm` — the
+INSTANTANEOUS clock — exactly twice, once before the loop and once after, and
+that is all the evidence there is. All six cold samples:
+
+| block | start → end |
+|---|---|
+| control (early) | 180 → 180 MHz |
+| control (late) | 1417 → 210 MHz |
+| async `read_ahead 2` (early) | 1792 → 2355 MHz |
+| async `read_ahead 1` | 1417 → 1095 MHz |
+| async `read_ahead 4` | 202 → 435 MHz |
+| async `read_ahead 2` repeat | 180 → 705 MHz |
+
+**Correction, 2026-09-14 15:30.** This finding first read "the control's SM
+clock is 180 → 180 MHz: it never **leaves** idle across a 10-minute block …
+the async blocks reach 1417–2355 MHz". Two samples ten minutes apart cannot
+support "never", and `sm_clock_mhz`'s own docstring warns that this box's boost
+clock moved 442–952 MHz *inside* one measurement run. The second half was
+wrong in a second way: 1417–2355 MHz describes two of the four async blocks,
+and the headline block itself STARTS at 180 MHz. What the six samples support is
+the weaker claim above — one control block sampled at idle on both ends, no
+async block did — and that is all this instrument can say. The claim, as
+originally written, propagated to `benchmarks/README.md` and to the changelog
+fragment; both are corrected with it.
 
 **Against the floor.** §18a put the read-free step at **14.25 s at seq 256**;
-the numbers above are at **seq 512**, so this is not a like-for-like ratio and
-is quoted as an order of magnitude, not a factor: the best cold step here is
-30.28 s, so the read path is still roughly half the step. **Still read-bound,
-much less so.**
+the numbers above are at **seq 512**, so that is not a like-for-like ratio and
+is quoted as an order of magnitude, not a factor. For what the read path costs
+*in this block*, the instrumented copy brackets are the measurement to use, not
+that comparison: **84.7%** of the headline step (25.168 s of copy per 29.708 s
+step, `async_cold_synth70b_nf4_ra2_repeat.json`), agreeing with §8's independent
+per-layer accounting of 82.6–84.9%. **Still read-bound, and by about the same
+fraction as before.**
+
+**Correction, 2026-09-14 15:30.** The sentence here previously read "the best
+cold step here is 30.28 s, so the read path is still roughly half the step" —
+which is a factor, computed from the pair the sentence before it had just
+declared not like-for-like, and it contradicted §8 and §10's 90–93%. It is
+replaced by the one figure the block's own instrumentation gives. See also §11:
+there is no valid read-free floor at seq 512 to compare against.
 
 ---
 
@@ -174,13 +230,13 @@ much less so.**
 This is the part that changed the headline, and it is left in the order it
 happened.
 
-| order | depth | step (uninstrumented) | source rate | free phys at its baseline |
-|---|---|---|---|---|
-| 1st | `read_ahead 2` | 48.09 s | 1.464 GB/s | 19.95 GB |
-| 2nd | (sync control) | 100.35 s | 0.701 GB/s | 19.50 GB |
-| 3rd | `read_ahead 1` | 39.23 s | 1.794 GB/s | 24.99 GB |
-| 4th | `read_ahead 4` | 33.59 s | 2.095 GB/s | ~25 GB |
-| 5th | `read_ahead 2` **repeat** | **30.28 s** | 2.324 GB/s | ~24 GB |
+| order | depth | step (uninstrumented) | source rate | free phys at its baseline | JSON |
+|---|---|---|---|---|---|
+| 1st | `read_ahead 2` | 48.09 s | 1.464 GB/s | 19.95 GB | `async_cold_synth70b_nf4.json` |
+| 2nd | (sync control) | 100.35 s | 0.701 GB/s | 19.50 GB | `control_sync_cold_synth70b_nf4.json` |
+| 3rd | `read_ahead 1` | 39.23 s | 1.794 GB/s | 24.99 GB | `async_cold_synth70b_nf4_ra1.json` |
+| 4th | `read_ahead 4` | 33.59 s | 2.095 GB/s | ~25 GB | `async_cold_synth70b_nf4_ra4.json` |
+| 5th | `read_ahead 2` **repeat** | **30.28 s** | 2.324 GB/s | ~24 GB | `async_cold_synth70b_nf4_ra2_repeat.json` |
 
 Read the first four rows alone and depth 4 is the winner and depth 2 the worst.
 Read the fifth and that collapses: **the same configuration is 48.09 s run first
@@ -188,7 +244,12 @@ and 30.28 s run last, 1.59x apart with nothing changed but position** — larger
 than the entire spread across depths (33.59–48.09 s).
 
 **Finding 3 — depths 1, 2 and 4 are not distinguishable on this evidence, and
-what looked like a depth effect was the page cache warming across blocks.** The
+what looked like a depth effect is consistent with the page cache warming across
+blocks.** (That verb was "was" until 2026-09-14 15:30. The *ordering* result is
+proved by the repeat; the *mechanism* is correlational — free physical memory
+grew 19.95 → ~25 GB alongside 48.09 → 30.28 s — and session-scale clock and
+thermal effects are not excluded, which the `sm_clock_mhz` docstring cited in
+Finding 2b warns about directly.) The
 brief anticipated "if depth changes nothing, say so"; the honest version is
 stronger, because the confound would have produced a confident and wrong
 recommendation. Free physical RAM grew across the sequence (Windows enlarged the
@@ -211,14 +272,22 @@ each and so take one slot apiece however deep the decoder runs).
 instrumentation on. On the RAM tier those agree to 0.06% (§3 of the probe
 record). Here:
 
-| block | plain | instrumented | ratio |
-|---|---|---|---|
-| sync control (cold) | 100.35 s | 104.95 s | 1.046x |
-| async `read_ahead 1` | 39.23 s | 38.63 s | 0.98x |
-| async `read_ahead 2` | 48.09 s | **545.66 s** | **11.35x** |
-| async `read_ahead 4` | 33.59 s | 33.38 s | 0.99x |
-| sync control (cold, repeat) | 92.25 s | 93.48 s | 1.013x |
-| async `read_ahead 2` **repeat** | 30.28 s | 29.71 s | 0.98x |
+| block | plain | instrumented | ratio | JSON |
+|---|---|---|---|---|
+| sync control (cold) | 100.35 s | 104.95 s | 1.046x | `control_sync_cold_synth70b_nf4.json` |
+| async `read_ahead 1` | 39.23 s | 38.63 s | 0.98x | `async_cold_synth70b_nf4_ra1.json` |
+| async `read_ahead 2` | 48.09 s | **545.66 s** | **11.35x** | `async_cold_synth70b_nf4.json` |
+| async `read_ahead 4` | 33.59 s | 33.38 s | 0.99x | `async_cold_synth70b_nf4_ra4.json` |
+| sync control (cold, repeat) | 92.25 s | 93.48 s | 1.013x | `control_sync_cold_synth70b_nf4_last.json` |
+| async `read_ahead 2` **repeat** | 30.28 s | 29.71 s | 0.98x | `async_cold_synth70b_nf4_ra2_repeat.json` |
+
+**The 545.66 s is a block MEAN over one pathological step, not a block.** Its
+six instrumented steps are 49.39, 47.71, 46.42, 47.07, 48.32 and **3035.06** s.
+Five of the six sit inside the plain block's own 43.3–52.5 s range, so the
+instrumentation was free in that block too; the artifact is a single step, and
+3024 s of it is inside the copy brackets. (Added 2026-09-14 15:30. The per-step
+shape is a sharper statement than the mean, and it would have refuted the 13:15
+localisation below immediately, without needing the `read_ahead 4` block.)
 
 **Correction, 2026-09-14 13:15 → 13:35.** On the strength of the first three
 rows I wrote that the artifact was "specific to the async source" and localised
@@ -246,38 +315,86 @@ Mistral-7B NF4, 4.138 GB store entirely in the page cache, batch 1 × seq 512,
 8 timed after 3 warm-up, uninstrumented. Run in the order listed; the store is
 4.1 GB against ~24 GB of free RAM, so all three were fully cached.
 
-| arm | step | tok/s | source rate |
-|---|---|---|---|
-| async disk, `read_ahead 2`, pinned | **1.84 s** | 277.8 | 4.016 GB/s |
-| control, shipped sync `DiskSource` | **1.54 s** | 333.6 | 4.822 GB/s |
-| RAM tier, same session | **0.82 s** | 627.8 | 9.075 GB/s |
+| order | arm | step | tok/s | source rate | JSON |
+|---|---|---|---|---|---|
+| 1st | async disk, `read_ahead 2`, pinned | **1.843 s** | 277.8 | 4.016 GB/s | `async_warm_mistral7b_nf4.json` |
+| 2nd | control, shipped sync `DiskSource` | **1.535 s** | 333.5 | 4.822 GB/s | `control_sync_warm_mistral7b_nf4.json` |
+| 3rd | RAM tier, same session | **0.816 s** | 627.8 | 9.075 GB/s | `ram_warm_mistral7b_nf4_today.json` |
 
-**Finding 5 — with the whole store in the page cache the async source costs
-1.19x against the source it replaces.** Against §8's published warm before
-(2.46 s, 177–208 tok/s) the same number would read as a **1.34x improvement**,
-and that framing would be wrong: today's box is simply faster than that session.
-**This is the single clearest argument for the same-day control**, and the
-reason §8 is not used as the warm baseline here.
+**The async arm ran FIRST, which is the confound §3 exists to catch, and it was
+not disclosed here until 2026-09-14 15:30.** The three `started` stamps are
+14:11:34, 14:14:21 and 14:15:15, and the hour before them was cold 70B blocks
+whose reads would have pressured the 4.1 GB Mistral store out of the page cache.
+Three warm-up steps pull it back in, so the timed steps are cached either way —
+but §3 had just established that position alone moved an identical configuration
+by 1.59x on this box, and the bias here runs *against* the async arm. That is an
+argument, not a measurement, and this record's standard is the difference.
+
+**So the trio was re-run in the reverse order, 2026-09-14 15:57–16:01**, same
+fixture, same flags, same harness, baseline commit charge `27.25 GB of 51.32 GB,
+free phys 17.50 GB` before and `27.39 GB / 17.30 GB` after:
+
+| order | arm | step | tok/s | source rate | JSON |
+|---|---|---|---|---|---|
+| 1st | RAM tier | **1.101 s** (1.090–1.121) | 465.1 | 6.723 GB/s | `ram_warm_mistral7b_nf4_reverse.json` |
+| 2nd | control, shipped sync `DiskSource` | **2.022 s** (2.003–2.057) | 253.2 | 3.660 GB/s | `control_sync_warm_mistral7b_nf4_reverse.json` |
+| 3rd | async disk, `read_ahead 2`, pinned | **2.089 s** (2.034–2.141) | 245.1 | 3.544 GB/s | `async_warm_mistral7b_nf4_reverse.json` |
+
+**Finding 5 — with the whole store in the page cache the async source is slower
+than the source it replaces in BOTH orders, by 1.20x when it runs first and
+1.03x when it runs last.** The direction survives the confound; the magnitude
+does not. Neither order gives a position-matched pair — the async arm and the
+control never occupy the same slot — so 1.03–1.20x is the honest range and
+neither end is the answer.
+
+Two things make that reading defensible rather than a shrug. The arms that are
+NOT the async source agree across the two sessions: control/RAM is 1.88x in the
+first block and 1.84x in the second. And every absolute is ~1.3x slower in the
+second block (RAM 0.816 → 1.101 s, control 1.535 → 2.022 s), so cross-session
+absolutes are not comparable at all — only the within-block ratios are, which is
+exactly why the same-day control exists.
+
+The earlier claim here was "the async source costs **1.19x**" (1.84/1.54 rounded
+from already-rounded inputs; from the stored values it is 1.20x), stated without
+the order. Against §8's published warm before (2.46 s, 177–208 tok/s) the same
+number would read as a **1.33x improvement**, and that framing would be wrong:
+today's box is simply faster than that session. **This is the single clearest
+argument for the same-day control**, and the reason §8 is not used as the warm
+baseline here.
 
 The reading is unsurprising once stated: with the store cached, a synchronous
 `mmap` read is close to a `memcpy`, so there is nothing for a background reader
 to hide, and the handoff, the staging copy and the release/drain synchronisation
 are pure overhead. The async source exists for a store that does **not** fit
-RAM. When it does fit, the RAM tier is the right answer anyway — 1.9x faster
-than the synchronous disk arm and 2.2x faster than the async one.
+RAM. When it does fit, the RAM tier is the right answer anyway — 1.88x faster
+than the synchronous disk arm and 2.26x faster than the async one in the first
+block, 1.84x and 1.90x in the reverse one. (Those two figures read "1.9x" and
+"2.2x" until 2026-09-14 15:30; both were rounded from already-rounded inputs,
+and the second is 1.84315/0.81554 = 2.2601.)
 
 Ablation on the warm async source (2 interleaved rounds, uninstrumented):
 
+JSON: `async_warm_mistral7b_nf4.json` (the same file as the first warm block —
+the ablation arms are extra records in it).
+
 | arm | round 0 | round 1 |
 |---|---|---|
-| A baseline | 1.71 s | 1.75 s |
-| B no source read, no copy | **0.74 s** | 0.74 s |
-| C no NF4 dequantisation | 1.79 s | 1.81 s |
-| D neither | 0.60 s | 0.59 s |
+| A baseline | 1.710 s | 1.752 s |
+| B no source read, no copy | **0.740 s** | 0.738 s |
+| C no NF4 dequantisation | 1.789 s | 1.808 s |
+| D neither | 0.601 s | 0.589 s |
 
 Removing the read path buys 57% (§10 measured 65% on the shipped source in its
 own session), and arm B at 0.74 s sits just under the RAM tier's 0.82 s, as it
 should — B removes the device copy too.
+
+**Arm C is SLOWER than arm A in both rounds and that is not explained here.**
+Removing NF4 dequantisation "costs" 4.6% and 3.2%; the sibling record's §10 saw
+the same sign on the same fixture (−8.7% / −2.4%). The two rounds of each arm
+differ by 2.5% (A) and 1.1% (C), so the effect is around the size of the
+round-to-round spread and this record does not claim a mechanism for it.
+(Added 2026-09-14 15:30 — publishing a negative saving with no comment was the
+one place this section fell short of the record's own standard.)
 
 ---
 
@@ -294,12 +411,21 @@ pre-allocated buffer. That is the "no mmap" half of the spec showing up as a
 side effect rather than as a designed measurement.
 
 **The 30 s no-progress guard never fired.** No log from any block contains
-"no progress", including the 545.66 s step. Reading the code, that is expected
-rather than lucky: the raise in `get` is guarded by `self._in_flight != idx and
-idx not in self._queue`, so a read that is merely slow keeps looping and only a
-reader that has stopped making progress trips it. **The guess was not tested by
-these runs** — nothing here establishes whether 30 s is the right number for a
-reader that genuinely stalls.
+"no progress", including the 3035.06 s step (the block whose MEAN is 545.66 s;
+see §4). Reading the code, that is expected rather than lucky: the raise in
+`get` is guarded by `self._in_flight != idx and idx not in self._queue`, so a
+read that is merely slow keeps looping and only a reader that has stopped making
+progress trips it. **The guess was not tested by these runs** — nothing here
+establishes whether 30 s is the right number for a reader that genuinely stalls.
+
+**Follow-up, 2026-09-14 15:30.** The whole-branch review then showed the
+conjunction could not fire at all on the single-consumer path: the demand push
+puts the layer in `_queue` before the wait, and the reader moves it
+queue → `_in_flight` → `_slot_of` under the lock, so it is always in exactly one
+of the three. It has been replaced by two checks that CAN fire — a reader thread
+that exited without recording an error, and one read in flight past a limit
+derived from §8 below. The 3035.06 s step would not have tripped the new limit
+either, and should not have: its brackets are a consumer waiting, not one read.
 
 ---
 
@@ -328,25 +454,64 @@ vocabulary-sized read is planned ahead of decoder layer 0 at the moment the
 compute thread blocks on layer 0. `benchmarks/harness/layer0_wait.py` drives the
 probe's own instruments and labels each load bracket with the layer it belongs
 to. Cold 70B, depth 2, three steps, no warm-up, instrumented from step 0 — so
-its **absolute** step times (65.0, 55.0, 52.9 s) are not throughput evidence;
-the ratio is what it measures.
+its **absolute** step times (49.2, 39.4, 39.3 s) are not throughput evidence;
+the ratio is what it measures. JSON:
+`layer0_wait_cold_synth70b_nf4.json`.
 
-| step | layer 0, forward / backward | other layers, mean / median / max | vocabulary loads |
-|---|---|---|---|
-| 0 | **28** / 455 ms | 363 / 401 / 592 ms | 874, 513 ms |
-| 1 | **25** / 389 ms | 327 / 338 / 504 ms | 41, 43 ms |
-| 2 | **25** / 344 ms | 313 / 322 / 549 ms | 32, 43 ms |
+| step | layer 0, forward / backward | other layers, mean / median / max | vocabulary loads | brackets |
+|---|---|---|---|---|
+| 0 | **17** / 271 ms | 252 / 283 / 420 ms | 662, 386 ms | 40.6 s of 49.2 s = 82.6% |
+| 1 | **17** / 259 ms | 214 / 266 / 533 ms | 33, 22 ms | 33.5 s of 39.4 s = 84.9% |
+| 2 | **16** / 268 ms | 213 / 270 / 327 ms | 33, 22 ms | 33.3 s of 39.3 s = 84.8% |
 
-**Finding 8 — layer 0's forward load is the FASTEST load of the step**, 25–28 ms
-against a 313–363 ms mean, because the reader has the whole build and embedding
+**RE-MEASURED 2026-09-14 15:53, and this table is the re-run.** The JSON
+published first was produced by a copy of the driver in a session scratchpad: it
+recorded `"driver": "C:\\…\\scratchpad\\layer0_wait.py"` and carried no
+`source_class` key at all, while the committed `benchmarks/harness/
+layer0_wait.py` hardcodes its own path and always writes `source_class`. The
+block was identifiable as the async source by inference (`pinned: true`,
+`read_ahead: 2`, `store_gb: 1.9566` — exactly depth-2 async staging, and
+impossible for the control, whose `store_gb` is 0.0), but not verifiable, and
+#379 — published numbers whose harness left with the machine — is the whole
+reason that file is committed. Re-run from the committed path, baseline commit
+charge `27.65 GB of 51.32 GB, free phys 16.96 GB` before and `27.25 GB /
+17.24 GB` after, with another session's Python resident throughout (§9's
+standing condition). The new JSON records `"driver":
+"benchmarks/harness/layer0_wait.py"` and `"source_class": "AsyncDiskSource"`.
+
+**Every figure moved and every finding held.** The steps are faster (49.2/39.4/
+39.3 against 65.0/55.0/52.9 — a warmer page cache, §3's effect again), the
+absolute brackets are smaller, and the first-touch vocabulary read is 662 ms
+rather than 874 ms. The previous table's numbers are left above in this
+paragraph rather than deleted.
+
+**Finding 8 — layer 0's forward load is the FASTEST load of the step**, 16–17 ms
+against a 213–252 ms mean, because the reader has the whole build and embedding
 phase to stage it before the compute thread asks for it. Its backward visit is
-ordinary. The vocabulary read costs 874 ms exactly once, on the first touch of
-the first step, then 32–43 ms. The addendum offered a follow-up (refuse to plan
-out of a single-member group); **on this evidence it is not needed**, and that
-is scoped to one fixture, one depth, one shape.
+ordinary. The vocabulary reads cost 662 and 386 ms exactly once, on the first
+touch of the first step, then 33 and 22 ms. The addendum offered a follow-up
+(refuse to plan out of a single-member group); **on this evidence it is not
+needed**, and that is scoped to one fixture, one depth, one shape.
+
+**Finding 8a — layer 0 IS the largest single compute-stream stall, and that was
+left out of the first version of this section.** Total stall is 33/48/48 ms per
+step, and layer 0's forward stall is 14.99 ms in step 1 and 14.35 ms in step 2,
+against a 0.206 ms mean over every other layer. It is 0.04% of the step, so
+Finding 8 stands unchanged — but it is the only signal pointing the way the
+addendum's concern pointed, and "explained as far as the data allows" means
+printing it. (The first run recorded 23.21 and 19.49 ms for the same thing.)
 
 The same table carries the step's own accounting: the per-load brackets are
-**90–93% of the step**. This step is the read path.
+**82.6–84.9% of the step**, agreeing with the headline block's own instrumented
+share of 84.7% (§2). This step is the read path. (That figure read "90–93%"
+before the re-run; §2 and §10 are corrected to the re-measured one.)
+
+**The read limit in `get` is derived from this table.** The slowest single load
+bracket anywhere in the three steps is 662 ms; `_MAX_READ_SECONDS = 300` is
+three orders of magnitude above it, and ~15x the ~20 s a 441 MB decoder layer
+would take at this project's own worst measured source rate of 22 MB/s. A wedge
+detector that fired on a merely slow read would be deleted by the first operator
+to meet it.
 
 ---
 
@@ -366,12 +531,24 @@ memory and the other Python processes immediately before and after itself.
 | async `read_ahead 2` repeat | ~21 GB of 51.36 GB | ~24 GB | none |
 | control (late) | ~21 GB of 51.36 GB | ~24 GB | none |
 | warm 7B, three arms | ~21 GB of 51.36 GB | ~24 GB | none |
-| layer-0 probe | 25.46 GB of 51.33 GB | 20.40 GB | none |
+| layer-0 probe (first run) | 25.46 GB of 51.33 GB | 20.40 GB | none |
+| layer-0 probe (**re-run**, §8) | 27.65 GB of 51.32 GB | 16.96 GB | another session's Python resident (1.3 GB) |
+| warm 7B, **reverse order** (§5) | 27.25 GB of 51.32 GB | 17.50 GB | another session's Python resident (1.3 GB) |
+
+Three of those stamps are approximations (`~21 GB` / `~24 GB`), including both
+halves of the late pair the verdict rests on, where the protocol asks for the
+measured one-liner immediately before every timed block. The load-bearing half —
+whether other work was running — is stated definitely, so this is presentation
+rather than a gap in the protocol, but it is a gap in the presentation and is
+named rather than tidied away. The two 15:53–16:01 blocks carry real stamps.
 
 The early control ran with pytest present and the early async block did not,
 which biases that pair **in favour of the reported speedup**. The late pair
 (§2, rows 3–4) is clean on both sides, which is why it is the one quoted as the
 position-matched result.
+
+**The warm trio's ORDER is its own confound and §5 now says so**, with a
+reverse-order re-run beside it.
 
 ---
 
@@ -383,18 +560,20 @@ thread. Position-matched and same-session, a cold 70B-shaped NF4 step went from
 48.09 s (2.09x)** at the early one, with the source rate rising from 0.70–0.76
 GB/s to 1.46–2.32 GB/s and the GPU leaving idle clocks for the first time on
 this tier. Against §17's published 124.5 s it is 2.59x. **What bounds it now is
-still the read**: the per-load brackets are 90–93% of the step (§8), and §18a's
-read-free floor — at a shorter sequence, so an order of magnitude rather than a
-factor — is ~14 s against a best measured 30.28 s. The remaining levers are the
-ones §19 of the probe record already named and this project did not touch:
+still the read**: the per-load brackets are **84.7%** of the headline step, and
+§8's independent per-layer accounting puts them at 82.6–84.9%. There is no
+valid read-free floor at this sequence to compare against — see §11 — so no
+ratio is quoted for the remaining headroom. The remaining levers are the ones
+§19 of the probe record already named and this project did not touch:
 unbuffered sequential reads, both NVMe drives, layer-major micro-batching, and
 #842.
 
 Two things temper it. **Warm, this is a regression** (§5): with the store in the
-page cache the async source costs 1.19x against the one it replaces, and the
-right answer there is the RAM tier. And **no read-ahead depth was
-distinguishable** (§3) once the ordering confound was controlled, so the depth
-knob is, on this evidence, a staging-cost knob rather than a throughput one.
+page cache the async source costs 1.03–1.20x against the one it replaces
+depending on run order, and the right answer there is the RAM tier. And **no
+read-ahead depth was distinguishable** (§3) once the ordering confound was
+controlled, so the depth knob is, on this evidence, a staging-cost knob rather
+than a throughput one.
 
 ---
 
@@ -410,10 +589,22 @@ knob is, on this evidence, a staging-cost knob rather than a throughput one.
   named in §19 of the probe record as the remaining levers and none is in #927.
 - **`read_ahead 8`,** and any depth on the warm fixture (§3 says why 8 was
   dropped).
+- **A read-free floor at seq 512, so there is none to compare the cold step
+  against.** §18a's ~14.25 s is at seq 256 and extrapolated from 128/256; the
+  sibling record's only seq-512 read-free arm (`probe-rtx5070-what-bounds-
+  streaming.md` §18, 39.8 s) is *higher* than the best step measured here and is
+  invalidated there by WDDM spill. §2 and §10 therefore quote the measured
+  bracket share and no headroom ratio at all.
+- **A position-matched warm pair.** §5 now carries both run orders, but the
+  async arm and the control never occupy the same slot in either, so the warm
+  regression is bracketed (1.03–1.20x) rather than measured to a figure.
 - **Any shape other than batch 1 × seq 512,** and any sequence sweep. The
   read-free floor this is compared against was measured at seq 256/128.
 - **Whether 30 s is the right no-progress timeout.** It never fired (§6); a
-  reader that genuinely stalls was not constructed.
+  reader that genuinely stalls was not constructed. The guard has since been
+  replaced (§6's follow-up) and the new limit is derived from §8's slowest
+  measured bracket — which is a bound taken from data, still not a stall
+  constructed and observed on this hardware.
 - **Any architecture beyond llama (the 70B shape) and mistral,** any OS other
   than Windows 11, any card other than this one, and any tier interaction with
   `stream_source: auto`'s own RAM-vs-disk decision.

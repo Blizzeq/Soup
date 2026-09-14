@@ -59,8 +59,8 @@ DEFAULT_STREAM_READ_AHEAD = 2
 # Derived from the measurement, not guessed. `benchmarks/gate-927-async-nvme-
 # source.md` §8 and `benchmarks/results/probe-rtx5070/layer0_wait_cold_synth70b
 # _nf4.json` are the only per-layer record: over 478 load brackets on the cold
-# 70B-shaped fixture the slowest SINGLE one is 874 ms (the vocabulary matrix on
-# its first touch), against a 313-363 ms mean. Ten times that is 8.7 s, so the
+# 70B-shaped fixture the slowest SINGLE one is 662 ms (the vocabulary matrix on
+# its first touch), against a 213-252 ms mean. Ten times that is 6.6 s, so the
 # 300 s floor is what binds — and it binds with room: this project's own
 # worst-case source rate is 22 MB/s (the module docstring above), which is ~20 s
 # for one 441 MB decoder layer, so 300 s is ~15x the slowest read anyone here
@@ -720,7 +720,7 @@ class AsyncDiskSource:
                 f"layer-stream reader has been reading layer {self._in_flight} for "
                 f"{elapsed:.0f} s, past the {_MAX_READ_SECONDS:.0f} s limit (layer "
                 f"{idx} is waiting behind it). The slowest single layer read ever "
-                f"measured on this tier is 0.874 s, so this is a wedged read, not a "
+                f"measured on this tier is 0.662 s, so this is a wedged read, not a "
                 f"slow one. Refusing rather than blocking: a training run that stops "
                 f"without an error is worse than one that fails."
             )
