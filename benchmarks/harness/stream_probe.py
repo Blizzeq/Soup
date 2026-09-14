@@ -90,6 +90,15 @@ def parse_args() -> argparse.Namespace:
         default=2,
         help="layers the async disk source reads ahead (disk tier only)",
     )
+    parser.add_argument(
+        "--control-sync-source",
+        action="store_true",
+        help=(
+            "CONTROL (disk tier only): measure the SHIPPED synchronous "
+            "DiskSource instead of the async reader, in the same session as "
+            "the async block. --read-ahead then has no effect"
+        ),
+    )
     parser.add_argument("--seq", type=int, default=512)
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--steps", type=int, default=8, help="timed steps per point")
@@ -135,6 +144,54 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", required=True, help="JSON results file, rewritten per point")
     parser.add_argument("--label", default="", help="free text stored beside the results")
     return parser.parse_args()
+
+
+# ==========================================================================
+# the same-day control (see --control-sync-source)
+# ==========================================================================
+#: The shim's class name. Every run prints the source class it actually
+#: built and refuses when that disagrees with the flag, so a control block
+#: and a measured block can never be confused in the results file.
+CONTROL_SOURCE_NAME = "SyncDiskSourceControl"
+
+
+def install_sync_source_control() -> str:
+    """Point ``_build_source``'s lazy import at the SHIPPED synchronous source.
+
+    The pre-#927 "before" for the disk tier was measured on 2026-09-12, in a
+    different session on a card whose boost clock varies ~13% between
+    sessions. The runtime no longer constructs ``DiskSource`` for
+    ``tier='disk'``, and a measurement task must not change ``src/``, so the
+    same-day control is made here instead: the ONE name ``_build_source``
+    imports is replaced by a subclass of the shipped ``DiskSource`` that
+    accepts and ignores the two keyword arguments the async source added.
+
+    Nothing else moves. The buffer pool, the prefetcher and the layer wrapper
+    stay the shipped ones — exactly as they were before the release contract
+    landed — and ``_release_source`` is duck-typed, so it is a no-op against a
+    source that defines no ``release``. The control therefore isolates the
+    READ PATH and not a different scheduler.
+
+    ``pinned`` and ``read_ahead`` are set to what the shipped source honestly
+    has: no page-locked staging and no reader depth. ``runtime.stats()`` reads
+    both off the source, and ``nbytes`` is already 0 by ``DiskSource``'s own
+    design, so the preamble labels the block without being told to.
+    """
+    from soup_cli.utils import async_disk_source
+    from soup_cli.utils.layer_stream_runtime import DiskSource
+
+    class SyncDiskSourceControl(DiskSource):  # type: ignore[misc]
+        def __init__(
+            self, *args: Any, read_ahead: Any = None, pin: Any = False, **kwargs: Any
+        ):
+            del read_ahead, pin  # the async source's two additions, ignored
+            super().__init__(*args, **kwargs)
+            self.pinned = False
+            self.read_ahead = None
+
+    assert SyncDiskSourceControl.__name__ == CONTROL_SOURCE_NAME
+    async_disk_source.AsyncDiskSource = SyncDiskSourceControl
+    return CONTROL_SOURCE_NAME
 
 
 # ==========================================================================
@@ -335,6 +392,12 @@ def build(args: argparse.Namespace, device: str, dtype: str) -> Tuple[Any, ...]:
             notify=print,
         )
     shard_seconds = time.perf_counter() - started
+
+    if args.control_sync_source:
+        print(
+            f"source        CONTROL: {install_sync_source_control()} — the shipped "
+            "synchronous DiskSource replaces the async reader for this block"
+        )
 
     started = time.perf_counter()
     model, runtime = build_streamed_model(
@@ -823,6 +886,12 @@ def main() -> int:
     if not (args.ceiling or args.step or args.sweep or args.ablate):
         print("ERROR: choose at least one of --ceiling --step --sweep --ablate")
         return 2
+    if args.control_sync_source and args.tier != "disk":
+        print(
+            "ERROR: --control-sync-source is a DISK-tier control; the RAM tier "
+            "has no disk source to swap"
+        )
+        return 2
 
     import torch
 
@@ -850,6 +919,25 @@ def main() -> int:
         f"{'pinned' if stats['pinned'] else 'pageable'} on tier {stats['tier']} "
         f"(disk {stats['disk_bytes'] / 1e9:.3f} GB); build {build_s:.1f} s"
     )
+    # Guard: the class the runtime ACTUALLY built, every block, control or
+    # not. A shim left installed by accident would otherwise publish the
+    # pre-#927 read path as the measured one, which is the single worst
+    # mistake this record could make.
+    source_class = type(runtime.source).__name__
+    is_control = source_class == CONTROL_SOURCE_NAME
+    if is_control != bool(args.control_sync_source):
+        print(
+            f"ERROR: source guard — the runtime built a {source_class} while "
+            f"--control-sync-source was "
+            f"{'set' if args.control_sync_source else 'not set'}"
+        )
+        return 2
+    print(
+        f"{'source':<16}{source_class}  read_ahead {stats['read_ahead']}  "
+        f"staging {stats['store_bytes'] / 1e6:.0f} MB "
+        f"{'pinned' if stats['pinned'] else 'pageable'}"
+        + ("  [CONTROL: the pre-#927 synchronous read path]" if is_control else "")
+    )
     per_buffer_mb = stats["buffer_bytes"] / stats["buffers"] / 1e6
     print(f"{'buffers':<16}{stats['buffers']} x {per_buffer_mb:.1f} MB")
 
@@ -871,6 +959,9 @@ def main() -> int:
         "dtype": dtype,
         "tier": stats["tier"],
         "pinned": stats["pinned"],
+        "source_class": source_class,
+        "control_sync_source": bool(args.control_sync_source),
+        "read_ahead": stats["read_ahead"],
         "store_gb": stats["store_bytes"] / 1e9,
         "disk_gb": stats["disk_bytes"] / 1e9,
         "buffers": stats["buffers"],
