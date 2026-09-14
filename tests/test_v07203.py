@@ -2275,7 +2275,15 @@ class TestAutoTierFallback:
         """
         with pytest.raises(ValueError, match="training.stream_read_ahead") as excinfo:
             self._run(tmp_path, monkeypatch, free_ram=1000, stream_source="auto")
-        assert "host staging" in str(excinfo.value), str(excinfo.value)
+        message = str(excinfo.value)
+        assert "host staging" in message, message
+        # #971 re-review: the refusal must not promise a page-lock it may not
+        # get. `pin = plan.pinned and on_cuda`, so the staging is pageable on
+        # CPU/MPS, under `stream_pin: false`, and after a failed pin — the same
+        # over-promise that was removed from the disk-tier notes one commit
+        # earlier. The check is about host RAM either way, which is why the
+        # refusal is still correct there.
+        assert "page-locked when the box allows" in message, message
 
     def test_ram_refuses_instead_of_falling_back(self, tmp_path, monkeypatch):
         """`auto` trades speed to complete the run; `ram` is how an operator says

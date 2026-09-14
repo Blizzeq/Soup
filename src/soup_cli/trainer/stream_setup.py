@@ -184,10 +184,12 @@ def _validate_stream_staging_ram_fit(
 
     The disk tier had no host-RAM check at all: it predicted zero residency,
     which was true of the synchronous source it replaced and false of the async
-    one, which page-locks ``min(read_ahead, members) x group_bytes`` per
-    distinct layer shape for the whole run. On the 70B NF4 shape at the default
-    depth that is ~5 GB — on a box that reached this tier BECAUSE its RAM could
-    not hold the model. The RAM tier has had this check since v0.72.0
+    one, which holds ``min(read_ahead, members) x group_bytes`` of host RAM per
+    distinct layer shape for the whole run — page-locked where the box allows,
+    pageable otherwise, and the check is the same either way because the RAM is
+    held in both cases. On the 70B NF4 shape at the default depth that is
+    ~5 GB — on a box that reached this tier BECAUSE its RAM could not hold the
+    model. The RAM tier has had this check since v0.72.0
     (``free_ram_bytes`` against ``choose_tier``'s 0.7 headroom, strict ``<``);
     this is the same rule applied to the same resource.
 
@@ -212,9 +214,9 @@ def _validate_stream_staging_ram_fit(
         else f"Lower training.stream_read_ahead (currently {read_ahead}), "
     )
     raise ValueError(
-        f"layer streaming's disk tier would page-lock "
-        f"{staging_bytes / 1e9:.2f} GB of host staging at "
-        f"training.stream_read_ahead={read_ahead}, and with "
+        f"layer streaming's disk tier would hold "
+        f"{staging_bytes / 1e9:.2f} GB of host staging (page-locked when the "
+        f"box allows) at training.stream_read_ahead={read_ahead}, and with "
         f"{resident_ram / 1e9:.2f} GB of resident extras that needs "
         f"{required / 1e9:.2f} GB — more than the "
         f"{budget / 1e9:.2f} GB safety headroom on "

@@ -350,10 +350,10 @@ The 3B NF4-vs-bf16 rows differ by 1.85×, but attribute that to **pinning, not a
 The 3.32 GB 8B row above predates large-layer streaming: its untied, unquantised `embed_tokens` + `lm_head` both stayed resident and occupied 2.10 GB. Current code writes them as separate large-layer shards and reuses one device slot sized to the larger matrix, so an equally shaped untied pair should reclaim one matrix while a tied model keeps the same one-matrix requirement. CPU CI pins bit-exact logits for both controls. The updated CUDA peak remains to be measured on the reference RTX 3050; the historical 3.32 GB figure is not relabelled as a new measurement.
 
 **Honest scope:**
-- **RAM tier + disk overflow (v0.72.3).** `stream_source: auto` picks RAM when the store fits both dynamic free-RAM headroom and a physical-host ceiling, falls back to NVMe disk when not; SATA/HDD rejected. Correctness verified. **The read is off the compute thread**: a background reader parses each shard's header itself (no memory map) and stages `training.stream_read_ahead` layers into pinned host memory, so the GPU is fed while the next layer is still arriving. **Measured cold and warm against a same-day control of the source it replaces** (RTX 5070 Laptop, 2026-09-14, [record](../benchmarks/gate-971-async-nvme-source.md)).
+- **RAM tier + disk overflow (v0.72.3).** `stream_source: auto` picks RAM when the store fits both dynamic free-RAM headroom and a physical-host ceiling, falls back to NVMe disk when not; SATA/HDD rejected. Correctness verified. **The read is off the compute thread**: a background reader parses each shard's header itself (no memory map) and stages `training.stream_read_ahead` layers in host RAM (page-locked where the box allows — see `stream_pin` below), so the GPU is fed while the next layer is still arriving. **Measured cold and warm against a same-day control of the source it replaces** (RTX 5070 Laptop, 2026-09-14, [record](../benchmarks/gate-971-async-nvme-source.md)).
   - **Cold — a store larger than RAM, which is what this tier is for — is 2.1–3.1x faster.** On a 36 GB 70B-shaped NF4 store at batch 1 x seq 512 a step went from 92–100 s to **30–48 s**, each pair position-matched (5.1–5.6 -> **10.6–16.9 tok/s**; 0.70–0.76 -> **1.46–2.32 GB/s** at the source), against 124.5 s / 4.1 tok/s / 0.57 GB/s for the old synchronous path measured 2026-09-12 ([earlier record](../benchmarks/probe-rtx5070-what-bounds-streaming.md)). The range is position in the run, not depth — see below. Peak VRAM is unchanged at 4.38 GB.
   - **Warm — the whole store in the page cache — it is a REGRESSION**, 1.03–1.20x slower than the synchronous source depending on run order (1.84 s against 1.54 s with the async arm first, 2.09 s against 2.02 s with the order reversed, at batch 1 x 512 on a 4.1 GB Mistral-7B NF4 store). With the store cached a synchronous read is close to a `memcpy`, so there is nothing for a background reader to hide and the handoff is pure overhead. **If the store fits RAM, use the RAM tier** — 0.82 s in the same session, 1.8–2.3x faster than either disk arm.
-  - **It is still bound by the read**: per-layer read brackets are 83–85% of the cold step. There is no measured read-free floor at this sequence to compare that against — the ~14 s figure is at a shorter one — so no headroom ratio is quoted.
+  - **It is still bound by the read**: per-layer read brackets are 82.6–84.9% of the cold step. There is no measured read-free floor at this sequence to compare that against — the ~14 s figure is at a shorter one — so no headroom ratio is quoted.
   - **`stream_read_ahead` did not change throughput** in that record. Depths 1, 2 and 4 were indistinguishable once run order was controlled for — the same configuration measured 48.09 s run first and 30.28 s run last, as the page cache warmed across blocks, which is larger than the whole spread across depths. Treat it as a **host-memory knob**: 1.5 GB of pinned staging at depth 1, 2.0 GB at 2, 2.8 GB at 4 on a 70B. The pre-flight prints that figure on the disk tier (`host staging read_ahead N -> X MB`) and **refuses the run** when it plus the resident extras will not fit the free-RAM headroom, naming `stream_read_ahead` as the knob to lower — the embedding and an untied `lm_head` take one slot each at any depth, because they are one layer each.
   - **Disk-kind detection.** A paravirtual (virtio) disk reports `rotational=1` with no media hint, so a genuinely NVMe-backed cloud disk was misread as an HDD and refused (#365); detection now measures a bounded O_DIRECT sequential read when the rotational flag is unreliable and admits NVMe-class throughput (>= 1 GB/s), while a genuinely slow disk stays rejected. Set `training.stream_disk_kind: nvme` (or `ssd`/`hdd`) to override when detection is still wrong — the resolved value is printed beside what was detected.
 - **Apple APFS disk detection.** On macOS, an APFS volume may report `Apple Fabric`
@@ -375,34 +375,43 @@ The 3.32 GB 8B row above predates large-layer streaming: its untied, unquantised
 
 ### Forcing the pin (`training.stream_pin`)
 
-Pinning is chosen automatically; `stream_pin` is how a config overrides that choice.
+Pinning is chosen automatically; `stream_pin` is how a config overrides that choice. **Since
+#971 the flag covers both tiers**: on the RAM tier it decides whether the base store is
+page-locked, and on the disk tier whether the async reader's host *staging* is.
 
-- **`stream_pin: false`** forces the pageable RAM store. The pre-flight states the
-  throughput this costs — up to **6.56×** measured (Qwen2.5-32B NF4), **7.41×** on a
-  synthetic — rather than absorbing it silently. This is the escape hatch: it was the
-  only known mitigation while #331 was live.
-- **`stream_pin: true`** forces the page-locked store. **On the RAM tier it REFUSES the
-  run**, naming the store size, if the box cannot page-lock it — instead of degrading to
-  a pageable store and spending the whole margin pinning exists to provide.
-- **Unset (the default)** keeps today's behaviour: on the CUDA RAM tier, attempt a pinned store and fall back to
-  pageable and announce the cost when the host cannot page-lock it.
+- **Unset (the default)** attempts page-locked host memory on a CUDA target and **falls back
+  loudly** if the box cannot provide it — the base store on the RAM tier, the reader's
+  staging on the disk tier. The fallback names what it costs: host→device copies become
+  synchronous, and measured GPU utilisation drops from **~97% to ~79%**. On the disk tier it
+  also names `stream_read_ahead`, because the depth is what decides how much gets page-locked.
+- **`stream_pin: false`** forces pageable host memory on either tier — the base store on the
+  RAM tier, the reader's staging on the disk tier. The pre-flight states the throughput this
+  costs rather than absorbing it silently: up to **6.56×** measured (Qwen2.5-32B NF4),
+  **7.41×** on a synthetic. Those two figures were measured on the **RAM store**
+  ([record](../benchmarks/gate-h100-validation.md)); the same mechanism applies to the
+  reader's staging, but its magnitude there is not measured. This is also the escape hatch:
+  it was the only known mitigation while #331 was live.
+- **`stream_pin: true`** forces page-locked host memory and **REFUSES the run on a CUDA
+  target** if the box cannot provide it, instead of degrading to pageable and spending the
+  whole margin pinning exists to provide. The refusal names the store size on the RAM tier,
+  and `stream_read_ahead` on the disk tier.
 
-**Where `true` announces instead of refusing.** Pinning page-locks the RAM store so that
-host→device copies can overlap compute — so it needs both a RAM store *and* a device to
-copy to. In the two cases below one of those is missing, the request is **inapplicable
-rather than unsatisfiable**, and the run *proceeds with an announcement* rather than
-refusing:
+**Where `true` announces instead of refusing.** Page-locking needs a CUDA device to copy to.
+On a non-CUDA target there is nothing to force, so the request is **inapplicable rather than
+unsatisfiable** and the run *proceeds with an announcement*:
 
 | Tier / device | `stream_pin: true` does |
 |---|---|
-| RAM tier on CUDA | pins, or **refuses** naming the store size |
-| Disk tier (base does not fit in RAM, weights stream from NVMe) | announces that pinning does not apply, proceeds |
+| RAM tier on CUDA | pins the base store, or **refuses** naming the store size |
+| Disk tier on CUDA (base does not fit in RAM, weights stream from NVMe) | pins the reader's staging, or **refuses** naming `stream_read_ahead`, the depth that decides how much is page-locked |
 | Non-CUDA target (CPU or MPS) | announces that CUDA host pinning does not apply, proceeds with a pageable CPU source |
 
-Refusing on those two would brick the large-model runs the disk tier exists for, and
-would make `stream_pin: true` uncommittable to a `soup.yaml` shared between a GPU box and
-a non-CUDA box. The CUDA RAM tier is where the flag has real semantics, and there it still
-refuses.
+Refusing on a non-CUDA target would make `stream_pin: true` uncommittable to a `soup.yaml`
+shared between a GPU box and a non-CUDA box. **The disk-tier row changed in #971**: that tier
+used to announce that pinning did not apply and proceed, because it held nothing to
+page-lock. The async reader stages whole layers in host RAM, so the flag has real semantics
+there now — a `soup.yaml` carrying `stream_pin: true` that used to warn on the disk tier can
+refuse instead.
 
 Set while `stream_layers: false` the key is rejected as a footgun, like the other
 `stream_*` keys.

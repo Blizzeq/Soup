@@ -852,11 +852,12 @@ def decide_pinning(
 
     ``stream_pin`` (``training.stream_pin``) overrides the automatic choice:
     ``None`` keeps the behaviour above; ``False`` forces pageable host memory
-    and states its throughput cost; ``True`` forces the page-locked one — the
-    run then refuses (in the runtime) rather than falling back if the box
-    cannot page-lock it. The refusal itself lives where the pin is actually
-    attempted; here ``True`` only records the intent so the pre-flight reflects
-    it.
+    and states its throughput cost; ``True`` forces the page-locked one — on a
+    CUDA target the run then refuses (in the runtime) rather than falling back
+    if the box cannot page-lock it. The refusal itself lives where the pin is
+    actually attempted, which is also why a non-CUDA target does not refuse:
+    nothing is attempted there. Here ``True`` only records the intent so the
+    pre-flight reflects it.
 
     BOTH TIERS, since #971. The flag used to describe the RAM store alone,
     because the disk tier held nothing to page-lock; it now decides whether the
@@ -882,11 +883,22 @@ def decide_pinning(
     if stream_pin is True:
         return PinDecision(
             pinned=True,
+            # The tier gate this note used to carry ("on the RAM tier the run
+            # refuses") was dropped in #971 because the disk tier now HAS
+            # staging to page-lock and does refuse over it. The gate's OTHER
+            # reason is answered in the sentence rather than dropped with it:
+            # on a non-CUDA target nothing is page-locked at all — setup passes
+            # ``pin=plan.pinned and on_cuda`` and gates ``require_pin`` on the
+            # same flag — so an unconditional "the run refuses" would print a
+            # promise that path does not keep. It announces and proceeds.
             reason=(
                 "training.stream_pin=true forces page-locked host memory — the "
                 "base store on the RAM tier, the async reader's staging on the "
-                "disk tier. Either way the run refuses rather than falling back "
-                "to pageable memory if the box cannot page-lock it."
+                "disk tier. On a CUDA target the run refuses, on either tier, "
+                "rather than falling back to pageable memory if the box cannot "
+                "page-lock it; on a non-CUDA target there is no CUDA pinning to "
+                "force, so the request is announced as inapplicable and the run "
+                "proceeds with pageable host memory."
             ),
         )
     if pinned_limit_bytes is None:

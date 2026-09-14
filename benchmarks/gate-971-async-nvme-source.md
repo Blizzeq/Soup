@@ -479,11 +479,19 @@ charge `27.65 GB of 51.32 GB, free phys 16.96 GB` before and `27.25 GB /
 standing condition). The new JSON records `"driver":
 "benchmarks/harness/layer0_wait.py"` and `"source_class": "AsyncDiskSource"`.
 
-**Every figure moved and every finding held.** The steps are faster (49.2/39.4/
-39.3 against 65.0/55.0/52.9 — a warmer page cache, §3's effect again), the
-absolute brackets are smaller, and the first-touch vocabulary read is 662 ms
-rather than 874 ms. The previous table's numbers are left above in this
-paragraph rather than deleted.
+**Every figure moved and one finding did not hold.** The steps are faster
+(49.2/39.4/39.3 against 65.0/55.0/52.9 — a warmer page cache, §3's effect
+again), the absolute brackets are smaller, and the first-touch vocabulary read
+is 662 ms rather than 874 ms. The previous table's numbers are left above in
+this paragraph rather than deleted. **Every first-run figure quoted here
+(65.0/55.0/52.9 s, 874 ms, layer 0's 23.21 and 19.49 ms, the 90–93% bracket
+share) is SUPERSEDED, and because the re-run wrote the same filename the
+working tree no longer holds the JSON they came from — it survives in git
+history, at `0fd0f42f`, and it is the file that records a `driver` path under a
+session scratchpad and no `source_class` key at all: the copy of the driver
+that predates the committed harness.** They are quoted as history, never as
+evidence, and the commit is named so that "history" stays checkable. (Added
+2026-09-14 16:45, mirroring §1's note.)
 
 **Finding 8 — layer 0's forward load is the FASTEST load of the step**, 16–17 ms
 against a 213–252 ms mean, because the reader has the whole build and embedding
@@ -493,13 +501,57 @@ touch of the first step, then 33 and 22 ms. The addendum offered a follow-up
 (refuse to plan out of a single-member group); **on this evidence it is not
 needed**, and that is scoped to one fixture, one depth, one shape.
 
-**Finding 8a — layer 0 IS the largest single compute-stream stall, and that was
-left out of the first version of this section.** Total stall is 33/48/48 ms per
-step, and layer 0's forward stall is 14.99 ms in step 1 and 14.35 ms in step 2,
-against a 0.206 ms mean over every other layer. It is 0.04% of the step, so
-Finding 8 stands unchanged — but it is the only signal pointing the way the
-addendum's concern pointed, and "explained as far as the data allows" means
-printing it. (The first run recorded 23.21 and 19.49 ms for the same thing.)
+**Finding 8a — the largest single compute-stream stall is the VOCABULARY fetch,
+not layer 0 — and that IS the step-head item the addendum asked this section to
+check.** `_plan_queue` walks one index out of a single-member group, so the
+embedding is the step's first read with nothing staged ahead of it. Per step,
+from the `stalls` array of the JSON named above:
+
+| step | total stall | `large:model.embed_tokens.weight` | `layer000` forward | mean, other 79 decoder layers |
+|---|---|---|---|---|
+| 0 | 33.17 ms | **32.66 ms** | 0.17 ms | 0.0021 ms |
+| 1 | 47.92 ms | **32.61 ms** | 14.99 ms | 0.0020 ms |
+| 2 | 47.58 ms | **32.91 ms** | 14.35 ms | 0.0020 ms |
+
+The embedding out-stalls layer 0 in every one of the three steps, layer 0 is
+second in every one of them, and the other 79 decoder layers (158 stall entries)
+sit at 0.002 ms — four orders of magnitude below the embedding in all three
+steps (15,700x / 16,300x / 16,200x), and three to four below layer 0 in steps 1
+and 2 (7,500x / 7,100x; in step 0 layer 0 barely stalls, so that gap is only
+84x). In steps 1 and 2 the embedding's stall is nearly its entire load — 32.61
+of 33.12 ms, 32.91 of 33.46 ms — i.e. the compute thread waits out the step's
+first read almost exactly, which is the predicted single-member-group behaviour
+and not an inference about it. Step 0 is the exception in the useful direction:
+the reader has the build phase to start that 662 ms first touch, so only
+32.66 ms of it reaches the compute thread.
+
+**It is still not material, so Finding 8's ruling stands.** The step's entire
+stall — the embedding, `lm_head`, layer 0 and all 79 other decoder layers
+together, every one of the 162 entries — is 33/48/48 ms, which is
+**0.07–0.12% of the step** (0.067% / 0.122% / 0.121%), against per-load read
+brackets that are 82.6–84.9% of the same steps. Refusing to plan out of a
+single-member group would buy back at most that.
+
+**Correction, 2026-09-14 16:45.** This finding first read "layer 0 IS the largest
+single compute-stream stall … against a 0.206 ms mean over every other layer",
+and `benchmarks/README.md` carried the same sentence. Both halves are wrong
+against the file this section names, and they fail TOGETHER. The 0.206 ms mean
+is only reachable by counting the 32.6 ms embedding entry among "every other
+layer" — the mean over all 160 non-`layer000` entries is 0.2062 ms, of which the
+embedding alone supplies 0.2041 (32.657/160), so the comparison figure is
+carried almost entirely by the one entry that outranks layer 0. Exclude the
+embedding and the mean is 0.002 ms; include it and layer 0 is not the largest.
+**And it was not true of the FIRST run either**, which is worth stating because
+the obvious story — a conclusion refreshed with new numbers and left standing —
+is not what happened here. Recovered from git history (`0fd0f42f`, the JSON this
+re-run overwrote), that run stalls on `large:model.embed_tokens.weight` for
+39.06 / 39.06 / 32.97 ms against layer 0's 0.002 / 23.21 / 19.49 ms: the
+vocabulary fetch out-stalled layer 0 there too, in all three steps. What layer 0
+did have in that run was a three-to-four-order gap over the other decoder layers
+in the two steps where it stalled at all (23.21 ms against a 0.018 ms mean,
+19.49 against 0.002). So the defect was never a stale figure. It was comparing
+layer 0 against the decoder layers, and then quoting a mean that silently
+included the one entry that comparison had left out.
 
 The same table carries the step's own accounting: the per-load brackets are
 **82.6–84.9% of the step**, agreeing with the headline block's own instrumented
@@ -558,8 +610,11 @@ The cold disk tier is no longer bound by synchronous page faults on the compute
 thread. Position-matched and same-session, a cold 70B-shaped NF4 step went from
 **92.25 s to 30.28 s (3.05x)** at the late position and from **100.35 s to
 48.09 s (2.09x)** at the early one, with the source rate rising from 0.70–0.76
-GB/s to 1.46–2.32 GB/s and the GPU leaving idle clocks for the first time on
-this tier. Against §17's published 124.5 s it is 2.59x. **What bounds it now is
+GB/s to 1.46–2.32 GB/s. Against §17's published 124.5 s it is 2.59x. The GPU
+clock samples are deliberately NOT part of this verdict: two per block support
+only the weaker statement §2b makes, and an earlier draft of this paragraph
+claimed "the GPU leaving idle clocks for the first time on this tier" — the
+claim §2b retracts (corrected 2026-09-14 16:45). **What bounds it now is
 still the read**: the per-load brackets are **84.7%** of the headline step, and
 §8's independent per-layer accounting puts them at 82.6–84.9%. There is no
 valid read-free floor at this sequence to compare against — see §11 — so no
