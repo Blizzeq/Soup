@@ -1,4 +1,4 @@
-"""#927 — training.stream_read_ahead, mirroring stream_buffers."""
+"""#971 — training.stream_read_ahead, mirroring stream_buffers."""
 
 import pytest
 

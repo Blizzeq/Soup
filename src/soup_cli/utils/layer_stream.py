@@ -858,7 +858,7 @@ def decide_pinning(
     attempted; here ``True`` only records the intent so the pre-flight reflects
     it.
 
-    BOTH TIERS, since #927. The flag used to describe the RAM store alone,
+    BOTH TIERS, since #971. The flag used to describe the RAM store alone,
     because the disk tier held nothing to page-lock; it now decides whether the
     async reader's host STAGING is page-locked, and the runtime honours or
     refuses it there exactly as it does on the RAM tier. The reasons below name
@@ -1583,7 +1583,7 @@ def build_stream_plan(
         # Falling back is the point of stream_source='auto', but a silent
         # fallback to a slower path is the failure mode this project keeps
         # calling out elsewhere. Say what happened, and say what it costs:
-        # benchmarks/gate-927-async-nvme-source.md measured the gap against a
+        # benchmarks/gate-971-async-nvme-source.md measured the gap against a
         # same-day control of the synchronous source, cold on a store larger
         # than RAM and warm with the store fully cached. The honest summary is
         # that the disk tier is slower than RAM either way, which is why this
@@ -1611,7 +1611,7 @@ def build_stream_plan(
                 "holding the base resident. It is "
                 "slower than the RAM tier — measured 1.9-2.3x its step time with the "
                 "store fully cached, on one box "
-                "(benchmarks/gate-927-async-nvme-source.md); a store larger than "
+                "(benchmarks/gate-971-async-nvme-source.md); a store larger than "
                 "RAM has no RAM-tier comparison, which is what makes this a "
                 "fallback. Set stream_source='ram' to refuse rather than fall "
                 "back."
@@ -1625,7 +1625,7 @@ def build_stream_plan(
     #
     # NOT scoped to the RAM tier. It was, because the reason claimed a RAM store
     # the disk tier did not have and the runtime announced the inapplicability
-    # instead — but #927 gave the disk tier host staging that stream_pin now
+    # instead — but #971 gave the disk tier host staging that stream_pin now
     # honours or refuses, and deleted that announcement. Gating on the tier left
     # the two spellings of reaching disk printing different prose for the same
     # config: `stream_source: disk` on a RAM-sized box planned tier=ram, so this
@@ -1673,7 +1673,7 @@ def render_stream_panel(plan: StreamPlan, extra_lines: Sequence[str] = ()) -> Pa
         # training.stream_read_ahead and is not known until the source is
         # built — the runtime's own ready line prints it. So this says the
         # SHAPE and leaves the number to the line that has it, rather than
-        # claiming "nothing held resident", which stopped being true in #927.
+        # claiming "nothing held resident", which stopped being true in #971.
         store_line = (
             f"  base         streamed from disk across {plan.n_layers} layers, "
             f"staged by an async reader (no resident copy)"

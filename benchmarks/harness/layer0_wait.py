@@ -16,7 +16,7 @@ still the shipped scheduler, seen through the probe's own replicas.
 
 It instruments from the first step and takes no warm-up, so its ABSOLUTE step
 times are not throughput evidence — the ratio between layer 0 and the rest is
-what it measures. Record: ``benchmarks/gate-927-async-nvme-source.md`` §8.
+what it measures. Record: ``benchmarks/gate-971-async-nvme-source.md`` §8.
 
 Typical invocation::
 

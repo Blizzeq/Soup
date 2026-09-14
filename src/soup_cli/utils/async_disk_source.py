@@ -56,7 +56,7 @@ DEFAULT_STREAM_READ_AHEAD = 2
 
 # How long ONE layer's read may be in flight before `get` calls it a wedge.
 #
-# Derived from the measurement, not guessed. `benchmarks/gate-927-async-nvme-
+# Derived from the measurement, not guessed. `benchmarks/gate-971-async-nvme-
 # source.md` §8 and `benchmarks/results/probe-rtx5070/layer0_wait_cold_synth70b
 # _nf4.json` are the only per-layer record: over 478 load brackets on the cold
 # 70B-shaped fixture the slowest SINGLE one is 662 ms (the vocabulary matrix on

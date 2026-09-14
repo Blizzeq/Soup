@@ -15,14 +15,14 @@ from the NF4 shard cache on C: (disk 0); D: holds only the bf16 source
 checkpoint, which is read during sharding and was a cache hit throughout.
 Stack: Python 3.12.10 · torch 2.14.0+cu130 · transformers 5.17.0 · peft 0.20.0
 · bitsandbytes 0.50.2 · safetensors 0.8.0.
-Soup: branch feat/async-nvme-source at 9e5ce63a (v0.75.0 + Tasks 1-5 of #927 +
+Soup: branch feat/async-nvme-source at 9e5ce63a (v0.75.0 + Tasks 1-5 of #971 +
 the two harness commits described in section 1).
 Harness: benchmarks/harness/stream_probe.py, plus benchmarks/harness/
 layer0_wait.py for section 8. Raw per-point JSON for every block is under
 benchmarks/results/probe-rtx5070/.
 -->
 
-# Gate record — #927: the async NVMe source, measured cold and warm
+# Gate record — #971: the async NVMe source, measured cold and warm
 
 **Status: MEASURED, 2026-09-14, with one negative result and one confound that
 changed the headline.** The cold disk tier got **2.1x–3.1x faster** depending on
@@ -56,7 +56,7 @@ of magnitude between blocks, and §18a put the **read-free floor at ~14.25 s** a
 seq 256. That record's verdict named the fix: "an asynchronous source with
 sequential unbuffered reads and pinned staging, off the compute thread".
 
-Tasks 1–5 of #927 built the first half of that — a background reader with its
+Tasks 1–5 of #971 built the first half of that — a background reader with its
 own header parsing (no mmap), pinned host staging, and a `training.stream_read_ahead`
 depth. This record asks whether the cold step actually got faster, and by how
 much. The honest ceiling for this project alone is the ~14 s floor, not the RAM
@@ -586,7 +586,7 @@ than a throughput one.
 - **The NVMe itself.** No block-level read test; 3.5+ GB/s sequential is the
   drive's published figure, not measured here.
 - **A second drive, striping, unbuffered/O_DIRECT reads, or #842.** All four are
-  named in §19 of the probe record as the remaining levers and none is in #927.
+  named in §19 of the probe record as the remaining levers and none is in #971.
 - **`read_ahead 8`,** and any depth on the warm fixture (§3 says why 8 was
   dropped).
 - **A read-free floor at seq 512, so there is none to compare the cold step

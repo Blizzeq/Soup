@@ -158,7 +158,7 @@ CONTROL_SOURCE_NAME = "SyncDiskSourceControl"
 def install_sync_source_control() -> str:
     """Point ``_build_source``'s lazy import at the SHIPPED synchronous source.
 
-    The pre-#927 "before" for the disk tier was measured on 2026-09-12, in a
+    The pre-#971 "before" for the disk tier was measured on 2026-09-12, in a
     different session on a card whose boost clock varies ~13% between
     sessions. The runtime no longer constructs ``DiskSource`` for
     ``tier='disk'``, and a measurement task must not change ``src/``, so the
@@ -410,7 +410,7 @@ def build(args: argparse.Namespace, device: str, dtype: str) -> Tuple[Any, ...]:
         buffers=args.buffers,
         read_ahead=args.read_ahead,
         # Both tiers stage through host memory now: the RAM tier's store, the
-        # disk tier's read-ahead staging (#927). Forcing pageable on disk here
+        # disk tier's read-ahead staging (#971). Forcing pageable on disk here
         # would have measured the fallback path, not the shipped one.
         pin=not args.no_pin,
         seed=args.seed,
@@ -463,7 +463,7 @@ class Instruments:
 
         # The shipped body tells the source its staging slot is free; a replica
         # that skipped it would be refused by AsyncDiskSource at the second
-        # layer (#927) and would measure a different contract on the RAM tier.
+        # layer (#971) and would measure a different contract on the RAM tier.
         from soup_cli.utils.layer_stream_runtime import _release_source
 
         pool = self.pool
@@ -921,7 +921,7 @@ def main() -> int:
     )
     # Guard: the class the runtime ACTUALLY built, every block, control or
     # not. A shim left installed by accident would otherwise publish the
-    # pre-#927 read path as the measured one, which is the single worst
+    # pre-#971 read path as the measured one, which is the single worst
     # mistake this record could make.
     source_class = type(runtime.source).__name__
     is_control = source_class == CONTROL_SOURCE_NAME
@@ -936,7 +936,7 @@ def main() -> int:
         f"{'source':<16}{source_class}  read_ahead {stats['read_ahead']}  "
         f"staging {stats['store_bytes'] / 1e6:.0f} MB "
         f"{'pinned' if stats['pinned'] else 'pageable'}"
-        + ("  [CONTROL: the pre-#927 synchronous read path]" if is_control else "")
+        + ("  [CONTROL: the pre-#971 synchronous read path]" if is_control else "")
     )
     per_buffer_mb = stats["buffer_bytes"] / stats["buffers"] / 1e6
     print(f"{'buffers':<16}{stats['buffers']} x {per_buffer_mb:.1f} MB")

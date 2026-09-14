@@ -1,4 +1,4 @@
-"""#927 — the disk tier reads on a background thread, not on the compute thread."""
+"""#971 — the disk tier reads on a background thread, not on the compute thread."""
 
 import threading
 import time
@@ -60,7 +60,7 @@ def _raw_bytes(tensor):
     Flatten first, then view: torch refuses a dtype-``view`` on a 0-dim tensor,
     so the bare ``tensor.view(torch.uint8)`` this file used could not compare a
     scalar at all — the same restriction that made ``read_into`` unable to fill
-    one. Same idiom as test_issue927_safetensors_reader.py.
+    one. Same idiom as test_issue971_safetensors_reader.py.
     """
     return tensor.reshape(-1).view(torch.uint8)
 

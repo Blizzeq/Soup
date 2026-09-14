@@ -1,4 +1,4 @@
-"""#927 — parse a safetensors header without mapping the file."""
+"""#971 — parse a safetensors header without mapping the file."""
 
 import json
 import struct

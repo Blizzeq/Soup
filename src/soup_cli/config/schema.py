@@ -3206,7 +3206,7 @@ class TrainingConfig(BaseModel):
             raise ValueError("training.stream_buffers must be an int, not bool")
         return v
 
-    # #927 — depth of the async disk-tier reader's background lookahead. NOT
+    # #971 — depth of the async disk-tier reader's background lookahead. NOT
     # the same quantity as stream_buffers (VRAM buffers): this is HOST-side
     # pinned-memory staging ahead of the disk read. One staging slot is always
     # held by the layer currently being consumed, so a setting of N stages
@@ -5223,7 +5223,7 @@ class SoupConfig(BaseModel):
                     "base layer-by-layer."
                 )
             return self
-        # #927 — `stream_source: 'ram'` INSISTS on the RAM tier: 'ram' insists,
+        # #971 — `stream_source: 'ram'` INSISTS on the RAM tier: 'ram' insists,
         # 'disk' forces, 'auto' falls back (trainer/stream_setup.py). The
         # read-ahead reader belongs to the NVMe disk tier, so a non-default
         # depth beside 'ram' is a setting that validates, is documented, and

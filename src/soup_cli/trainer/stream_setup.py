@@ -802,7 +802,7 @@ class StreamingSetupMixin:
             # #366: training.stream_pin (None/False/True) overrides the automatic
             # pinning choice so the pageable escape hatch is reachable from config.
             stream_pin=tcfg.stream_pin,
-            # #927: the depth decides how much host memory the async reader
+            # #971: the depth decides how much host memory the async reader
             # page-locks, so the plan has to carry it or the pre-flight is
             # predicting zero residency for a tier that holds GBs of it.
             read_ahead=tcfg.stream_read_ahead,
@@ -822,7 +822,7 @@ class StreamingSetupMixin:
             # `pinned` is deliberately NOT zeroed with them. It described the
             # RAM store, but `pin=plan.pinned and on_cuda` below now also
             # decides whether the disk tier's host STAGING is page-locked
-            # (#927). Zeroing it here would stage pageable for a run that
+            # (#971). Zeroing it here would stage pageable for a run that
             # reached the disk tier via `stream_source: disk` and pinned for one
             # that reached the same tier via `auto` — one tier, two behaviours,
             # chosen by the spelling.
@@ -853,10 +853,10 @@ class StreamingSetupMixin:
                     "resident, and is slower than the RAM "
                     "tier it is being used instead of — measured 1.9-2.3x its step "
                     "time with the store fully cached, on one box "
-                    "(benchmarks/gate-927-async-nvme-source.md).",
+                    "(benchmarks/gate-971-async-nvme-source.md).",
                 ),
             )
-        # #927 — HOST pre-flight, and it has to come after the tier is settled
+        # #971 — HOST pre-flight, and it has to come after the tier is settled
         # above: the async reader's staging is page-locked for the whole run and
         # nothing was charging it. Before the panel, because a refusal an
         # operator has to scroll past a summary to find reads as an afterthought.
@@ -932,14 +932,14 @@ class StreamingSetupMixin:
             device=self.device,
             dtype=dtype,
             buffers=tcfg.stream_buffers,
-            # #927: the depth the async reader stages to on the disk tier.
+            # #971: the depth the async reader stages to on the disk tier.
             # Ignored on the RAM tier, which holds every layer and reads
             # nothing ahead.
             read_ahead=tcfg.stream_read_ahead,
             pin=plan.pinned and on_cuda,
             # #366: stream_pin=true refuses rather than silently falling back to
             # pageable memory — on the RAM tier that is the store, and since
-            # #927 on the disk tier it is the reader's host staging. On
+            # #971 on the disk tier it is the reader's host staging. On
             # non-CUDA targets the notice above covers it, so require_pin is
             # gated on a real CUDA device.
             require_pin=(tcfg.stream_pin is True) and on_cuda,
@@ -964,7 +964,7 @@ class StreamingSetupMixin:
             )
         else:
             # Not "nothing held resident": the async reader stages `read_ahead`
-            # layers in host memory, so say how deep and how much (#927).
+            # layers in host memory, so say how deep and how much (#971).
             source_line = (
                 f"streamed from DISK ({stats['disk_bytes'] / 1e9:.2f} GB on an "
                 f"NVMe volume) by an async reader, "

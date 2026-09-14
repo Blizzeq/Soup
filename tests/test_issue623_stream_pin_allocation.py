@@ -229,7 +229,7 @@ def _drive_wiring(
             "pinned": bool(kwargs.get("pin")),
             # Derived from the captured kwargs, exactly as `pinned` is: what
             # the ready line prints must trace back to what the trainer PASSED,
-            # not to a constant this spy chose (#927).
+            # not to a constant this spy chose (#971).
             "read_ahead": kwargs.get("read_ahead"),
             "buffers": 2,
             "buffer_bytes": 4_000,
@@ -400,7 +400,7 @@ class TestTheAllocationItself:
 
 
 class TestTheReadAheadDepthIsWiredAndVisible:
-    """#927 / #748: `training.stream_read_ahead` must reach the runtime AND be
+    """#971 / #748: `training.stream_read_ahead` must reach the runtime AND be
     seen where it takes effect.
 
     Same harness as the pin tests above — real config, real pre-flight, spied
@@ -501,7 +501,7 @@ class TestTheReadAheadDepthIsWiredAndVisible:
         assert "stream_source='disk'" in plain, plain
         # What it costs, with a source — the same contract as the auto note.
         assert "slower than the RAM tier" in plain, plain
-        assert "gate-927-async-nvme-source.md" in plain, plain
+        assert "gate-971-async-nvme-source.md" in plain, plain
         # And the honest pinning wording.
         assert "page-locked where the box allows" in plain, plain
         assert "in pinned host RAM" not in plain, plain
@@ -509,7 +509,7 @@ class TestTheReadAheadDepthIsWiredAndVisible:
     def test_a_forced_disk_run_still_pins_its_staging(
         self, tmp_path, monkeypatch
     ) -> None:
-        """`stream_source: disk` used to zero `plan.pinned`, which since #927
+        """`stream_source: disk` used to zero `plan.pinned`, which since #971
         also decides whether the STAGING is page-locked. Left alone, the same
         tier reached by `disk` staged pageable and by `auto` staged pinned —
         one tier, two behaviours, chosen by the spelling."""

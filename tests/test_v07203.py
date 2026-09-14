@@ -1883,7 +1883,7 @@ class TestDiskTier:
         assert grads and sum(grads) > 0.0
 
     def test_only_the_readers_staging_is_held_resident(self, tmp_path):
-        """The point of the tier, restated honestly for #927.
+        """The point of the tier, restated honestly for #971.
 
         ``store_bytes`` was zero while the tier allocated a fresh tensor per
         call. The async reader stages ``read_ahead`` layers in host memory, so
@@ -1902,7 +1902,7 @@ class TestDiskTier:
         )
 
     def test_stats_reports_the_readers_real_depth_not_a_constant(self, tmp_path):
-        """#927 / #748: the depth must be OBSERVABLE, and observed from the
+        """#971 / #748: the depth must be OBSERVABLE, and observed from the
         source rather than restated.
 
         A non-default depth is what makes this discriminating — a `stats()`
@@ -1970,7 +1970,7 @@ class TestDiskTier:
     def test_runtime_close_stops_the_reader_thread_and_frees_the_staging(
         self, tmp_path
     ):
-        """What close() releases on this tier changed with #927.
+        """What close() releases on this tier changed with #971.
 
         There are no shard handles to leak any more — ``AsyncDiskSource`` opens
         each shard per read precisely because a mapping charges Windows commit
@@ -2005,7 +2005,7 @@ _RAM_TIER_FREE_BYTES = 10_000_000_000
 #: Free RAM to report so the tiny base takes the DISK tier and the async
 #: reader's staging still fits. Two constraints now, not one: the store plus
 #: resident extras must EXCEED the 0.7 headroom (or `choose_tier` keeps RAM),
-#: and the staging plus those extras must fall UNDER it (or #927's host
+#: and the staging plus those extras must fall UNDER it (or #971's host
 #: pre-flight refuses the run). Measured on this fixture at the default
 #: read_ahead 2 — staging 197,632 B, resident extras 16,640 B, store 296,448 B —
 #: which puts the window at (306,103, 447,268]. The old value here was 1000,
@@ -2245,7 +2245,7 @@ class TestAutoTierFallback:
 
     def test_auto_falls_back_to_disk_when_it_does_not(self, tmp_path, monkeypatch):
         """``store_bytes`` was zero here for the same reason it was zero in
-        ``TestDiskTier``: the tier held nothing. Since #927 it holds the async
+        ``TestDiskTier``: the tier held nothing. Since #971 it holds the async
         reader's host staging, so the claim that distinguishes the tiers is no
         longer "nothing" but "a few layers rather than the whole model"."""
         wrapper = self._run(
@@ -2264,7 +2264,7 @@ class TestAutoTierFallback:
     def test_a_box_too_small_for_the_readers_staging_is_refused(
         self, tmp_path, monkeypatch
     ):
-        """#927: the disk tier predicted ZERO host residency while the async
+        """#971: the disk tier predicted ZERO host residency while the async
         reader page-locks whole layers for the run. Driven through the REAL
         pre-flight, not the validator alone — a check nothing calls is the #748
         class this branch keeps finding.
@@ -2438,8 +2438,8 @@ class TestAutoTierFallback:
         how to refuse it.
 
         Renamed from `..._says_the_cost_is_unmeasured`: it used to assert the
-        word "unmeasured", which was honest until #927 measured the gap
-        (benchmarks/gate-927-async-nvme-source.md). A test that pins the
+        word "unmeasured", which was honest until #971 measured the gap
+        (benchmarks/gate-971-async-nvme-source.md). A test that pins the
         ABSENCE of a number keeps the number out once someone goes and gets
         it, so it now pins the presence of one instead.
         """
@@ -2459,7 +2459,7 @@ class TestAutoTierFallback:
         # this note compares to, depending on run order — a single "2.2x"
         # published one order's number as if it were the measurement.
         assert "1.9-2.3x" in joined, joined
-        assert "gate-927-async-nvme-source.md" in joined, joined
+        assert "gate-971-async-nvme-source.md" in joined, joined
         # ...and it must NOT go back to promising nothing is held: the reader
         # stages read_ahead layers in host RAM.
         assert "unmeasured" not in joined, joined
@@ -2735,7 +2735,7 @@ def _tiny_stream(
         quant_suffixes=suffixes, quant_device="cpu",
     )
     # Omitted rather than defaulted, so the harness exercises the production
-    # default unless a test deliberately asks for another depth (#927).
+    # default unless a test deliberately asks for another depth (#971).
     depth = {} if read_ahead is None else {"read_ahead": read_ahead}
     model, runtime = build_streamed_model(
         model_id=str(weights), shard_dir=shards, index=index, lora_config=lora,

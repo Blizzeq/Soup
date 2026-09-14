@@ -466,7 +466,7 @@ class TestStreamPlan:
         """This assertion used to be its exact inverse, and the inversion is the
         finding. The note was withheld on the disk tier because it claimed a RAM
         store that tier did not have, and the runtime announced the
-        inapplicability instead — but #927 gave the disk tier host staging that
+        inapplicability instead — but #971 gave the disk tier host staging that
         `stream_pin` honours or refuses, and DELETED that announcement. Withheld,
         the explicit request was recorded nowhere at all on the tier where it now
         decides something. It must print, and it must name what this tier
@@ -2563,7 +2563,7 @@ _REFUSAL_SPEC = {"weight": ((_REFUSAL_HIDDEN, _REFUSAL_HIDDEN), "bfloat16")}
 #: 1.073 GB and 64 layers is 2.147 GB.
 _REFUSAL_STORE_SIZES = ((32, "1.07 GB"), (64, "2.15 GB"))
 #: The distinguishing phrase of the disk-tier "pinning is inapplicable here"
-#: announcement, DELETED in #927. It was true while the disk tier allocated a
+#: announcement, DELETED in #971. It was true while the disk tier allocated a
 #: fresh tensor per call and had nothing to page-lock; the async reader stages
 #: into reusable host buffers, which pin exactly as the RAM store does. Kept so
 #: the rewritten cases can assert it is ABSENT — a re-introduced explanation
@@ -2683,7 +2683,7 @@ class TestStreamPinRuntimeRefusal:
 
 
 class TestDiskTierPinsItsStagingOrRefuses:
-    """#927: the disk tier now pins the same way the RAM tier does.
+    """#971: the disk tier now pins the same way the RAM tier does.
 
     It used to ANNOUNCE that pinning was inapplicable, which was true while the
     tier allocated a fresh tensor per call — there was no host buffer to

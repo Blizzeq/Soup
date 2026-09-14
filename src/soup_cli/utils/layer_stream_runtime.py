@@ -2243,7 +2243,7 @@ def _build_source(
     The DISK tier now behaves the same way, for the same reason. It used to
     *announce* that pinning was inapplicable — true while the base streamed from
     NVMe into a freshly allocated tensor per call, with nothing to page-lock.
-    ``AsyncDiskSource`` reads ahead into reusable HOST STAGING (#927), and that
+    ``AsyncDiskSource`` reads ahead into reusable HOST STAGING (#971), and that
     staging is exactly the kind of memory pinning exists for: out of pageable
     memory the host-to-device copy is synchronous and the reader cannot overlap
     with compute. So an explicit ``training.stream_pin`` is honoured or refused
