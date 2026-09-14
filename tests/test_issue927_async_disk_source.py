@@ -1023,3 +1023,154 @@ class TestTheSettingReachesTheSource:
                 f"buffers but not read_ahead, so training.stream_read_ahead "
                 f"never reaches the source"
             )
+
+
+class TestEveryRuntimeConsumerReleases:
+    """A consumer that forgets ``release`` gets pre-fix behaviour SILENTLY.
+
+    The next ``get`` implicitly releases, the reader refills the slot, and the
+    still-draining copy reads another layer's bytes — measured through the real
+    pool at 6 of 8 layers on the default depth. ``_release_source`` is what the
+    consumers call and it cannot detect NOT being called, so the contract is
+    enforced from both ends: this scan is the static half, and
+    ``AsyncDiskSource._hold``'s refusal under pinned staging is the dynamic one.
+    Either alone leaves a gap — the scan cannot see a consumer written
+    elsewhere, and the refusal cannot fire on a code path no test exercises.
+    """
+
+    @staticmethod
+    def _functions_that_borrow():
+        """``Class.method`` -> whether it also calls ``_release_source``."""
+        import ast
+
+        path = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "soup_cli"
+            / "utils"
+            / "layer_stream_runtime.py"
+        )
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+
+        def _borrows(node: ast.AST) -> bool:
+            return any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "get"
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id == "source"
+                for call in ast.walk(node)
+            )
+
+        def _releases(node: ast.AST) -> bool:
+            return any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "_release_source"
+                for call in ast.walk(node)
+            )
+
+        found = {}
+        for parent in ast.walk(tree):
+            # Methods are named `Class.method`, so a scan that only walked
+            # module-level defs — where neither consumer lives — cannot pass
+            # by finding nothing.
+            if isinstance(parent, ast.ClassDef):
+                bodies = [(f"{parent.name}.{n.name}", n) for n in parent.body
+                          if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+            elif isinstance(parent, ast.Module):
+                bodies = [(n.name, n) for n in parent.body
+                          if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+            else:
+                continue
+            for name, node in bodies:
+                if _borrows(node):
+                    found[name] = _releases(node)
+        return found
+
+    def test_the_scan_sees_both_shipped_consumers(self):
+        """Positive control: a scan that finds nothing must FAIL, not pass."""
+        found = self._functions_that_borrow()
+        assert "LayerBufferPool.load_async" in found, found
+        assert "LargeLayerBufferPool.load_async" in found, found
+
+    def test_every_borrower_also_releases(self):
+        found = self._functions_that_borrow()
+        missing = sorted(name for name, releases in found.items() if not releases)
+        assert not missing, (
+            f"these functions call source.get() without calling "
+            f"_release_source(): {missing}. Out of PINNED host staging the "
+            f"copy is still draining when load_async returns, so the buffer "
+            f"must not be recycled until an event says it has landed."
+        )
+
+
+@pytest.mark.skipif(_NO_CUDA, reason="pinned staging needs a CUDA device")
+class TestPinnedStagingRefusesAnUnreleasedBorrow:
+    """The dynamic half of the contract (see the scan above).
+
+    Under PINNED staging the implicit release is unsound: the copy out of the
+    borrowed buffer is still in flight, so quietly reclaiming it is the exact
+    corruption ``release`` exists to prevent. Refusing is the only honest
+    answer — a silently wrong gradient is worse than a loud stop.
+    """
+
+    def test_a_second_get_without_release_is_refused(self, tmp_path):
+        shard_dir = _shards(tmp_path)
+        source = AsyncDiskSource(shard_dir, N_LAYERS, _spec(shard_dir), pin=True)
+        try:
+            assert source.pinned, "the hazard needs genuinely pinned staging"
+            source.get(0, "input_layernorm.weight")
+            with pytest.raises(RuntimeError, match="release") as excinfo:
+                source.get(1, "input_layernorm.weight")
+            message = str(excinfo.value)
+            assert "_release_source" in message, message
+            # Both layers named: which one is on loan, and which was wanted.
+            assert "0" in message and "1" in message, message
+        finally:
+            source.close()
+
+    def test_the_compliant_sequence_is_unaffected(self, tmp_path):
+        """The control that makes the refusal meaningful rather than a block on
+        all traffic: released, the very same sequence works."""
+        shard_dir = _shards(tmp_path)
+        source = AsyncDiskSource(shard_dir, N_LAYERS, _spec(shard_dir), pin=True)
+        try:
+            first = source.get(0, "input_layernorm.weight")
+            assert first is not None
+            # None is the TRUE event here: a direct get enqueues no copy.
+            source.release(0, None)
+            second = source.get(1, "input_layernorm.weight")
+            assert second.shape == first.shape
+        finally:
+            source.close()
+
+    def test_repeated_gets_for_the_same_layer_are_not_a_borrow_violation(
+        self, tmp_path
+    ):
+        """`load_async` calls `get` once per tensor NAME before releasing the
+        layer once. If that read as a violation the refusal would fire on the
+        real consumer's normal path."""
+        shard_dir = _shards(tmp_path)
+        spec = _spec(shard_dir)
+        source = AsyncDiskSource(shard_dir, N_LAYERS, spec, pin=True)
+        try:
+            for name in spec[0]:
+                assert source.get(0, name) is not None
+            source.release(0, None)
+        finally:
+            source.close()
+
+    def test_pageable_staging_still_permits_the_implicit_release(self, tmp_path):
+        """The carve-out, and why it is sound: out of PAGEABLE memory a
+        `non_blocking` copy is host-synchronous, so no copy can be in flight and
+        the documented borrow contract ("valid until your next get for a
+        different layer") still holds. Every direct-get test in this file and
+        the byte-identity gate rely on it."""
+        shard_dir = _shards(tmp_path)
+        source = AsyncDiskSource(shard_dir, N_LAYERS, _spec(shard_dir), pin=False)
+        try:
+            source.get(0, "input_layernorm.weight")
+            assert source.get(1, "input_layernorm.weight") is not None
+        finally:
+            source.close()

@@ -312,29 +312,56 @@ class AsyncDiskSource:
         return chosen
 
     def _hold(self, idx: int) -> None:
-        """Mark ``idx``'s slot as in use and implicitly release the rest. Lock held.
+        """Mark ``idx``'s slot as in use and release the rest. Lock held.
 
-        ``release()`` is the precise signal and the real buffer pool sends it.
-        A consumer that does not — every caller that predates this source, and
-        the byte-identity gate, which calls ``get`` directly — still gets the
-        contract this design always had: a reference from ``get`` is valid until
-        your next ``get`` for a different layer. Without that, slots handed out
-        to a release-unaware consumer would never come back and the reader would
-        stall until ``get``'s own timeout fired.
+        What "release the rest" may mean depends on how the staging was
+        allocated, and the split is the whole safety argument:
 
-        The implicit release carries NO drain event, which is correct: a
-        consumer that never calls ``release`` never enqueued an asynchronous
-        copy out of this buffer either.
+        * PAGEABLE staging keeps the implicit release. ``dst.copy_(...,
+          non_blocking=True)`` out of pageable memory is host-synchronous, so no
+          copy can still be in flight and the contract this design always had —
+          a reference from ``get`` is valid until your next ``get`` for a
+          different layer — is still true. Every caller that predates this
+          source relies on it, including the byte-identity gate, which calls
+          ``get`` directly; without it their slots would never come back and the
+          reader would stall until ``get``'s 30 s timeout fired. The implicit
+          release carries NO drain event, which is correct: a consumer that
+          never calls ``release`` never enqueued an asynchronous copy either.
+        * PINNED staging REFUSES instead. There the copy is genuinely still
+          draining when ``load_async`` returns, so reclaiming the buffer is the
+          corruption ``release`` exists to prevent, not a tidy-up. Silently
+          doing it is how 6 of 8 layers reached the device holding another
+          layer's weights. A loud stop is the only honest answer, because the
+          alternative is a wrong gradient with no error anywhere.
         """
         keep = self._slot_of.get(idx)
-        freed = False
-        for slot in range(len(self._slots)):
-            if slot != keep and self._live[slot]:
-                self._live[slot] = False
-                freed = True
+        borrowed = [
+            slot
+            for slot in range(len(self._slots))
+            if slot != keep and self._live[slot]
+        ]
+        if borrowed and self.pinned:
+            layer_in_slot = {held: lay for lay, held in self._slot_of.items()}
+            on_loan = sorted(
+                str(layer_in_slot[slot]) for slot in borrowed if slot in layer_in_slot
+            )
+            raise RuntimeError(
+                f"layer-stream staging for layer(s) {', '.join(on_loan) or '?'} "
+                f"is still on loan: get() handed it out and release() was never "
+                f"called, and now layer {idx} has been requested. With PINNED "
+                f"staging the host-to-device copy is still draining when "
+                f"load_async returns, so recycling that buffer puts another "
+                f"layer's weights on the device with no error at all — measured "
+                f"6 of 8 layers at the default depth. Call release(idx, event) "
+                f"once the copy is enqueued; layer_stream_runtime._release_source "
+                f"is what the buffer pools use. (Pageable staging permits the "
+                f"implicit release, because its copy is host-synchronous.)"
+            )
+        for slot in borrowed:
+            self._live[slot] = False
         if keep is not None:
             self._live[keep] = True
-        if freed:
+        if borrowed:
             self._ready.notify_all()
 
     def _plan_queue(self, idx: int) -> List[int]:
@@ -467,14 +494,23 @@ class AsyncDiskSource:
 
         This is a borrow, not a copy — which is the point, and which is the one
         way this source differs from ``RamSource`` (holds everything forever)
-        and ``DiskSource`` (allocates per call). Two rules follow:
+        and ``DiskSource`` (allocates per call). What you owe in return depends
+        on how the staging was allocated:
 
-        * The reference is valid until your next ``get`` for a different layer.
-        * If you enqueue an ASYNCHRONOUS copy out of it, you must say so with
-          ``release(idx, event)`` — otherwise the next ``get`` is taken as
-          "done", the reader refills the buffer, and your copy drains from
-          whatever it now holds. ``LayerBufferPool`` and ``LargeLayerBufferPool``
-          both do this; see ``layer_stream_runtime._release_source``.
+        * With PINNED staging (``pin=True``, the default and what production
+          runs on) ``release(idx, event)`` is REQUIRED. The copy out of the
+          buffer is still draining when ``load_async`` returns, so without it
+          the reader refills the slot underneath the copy and another layer's
+          weights land on the device. Asking for a different layer while one is
+          still on loan RAISES rather than recycling it silently.
+        * With PAGEABLE staging the copy is host-synchronous, so nothing can be
+          in flight and the older contract still holds: the reference is valid
+          until your next ``get`` for a different layer, and the implicit
+          release is sound.
+
+        ``LayerBufferPool`` and ``LargeLayerBufferPool`` both release; see
+        ``layer_stream_runtime._release_source``, and the scan in
+        ``TestEveryRuntimeConsumerReleases`` that keeps it that way.
         """
         with self._ready:
             while True:
