@@ -16,12 +16,22 @@ from soup_cli.utils.safetensors_reader import TensorRange, read_header  # noqa: 
 
 
 def _mixed_shard(tmp_path: Path) -> str:
-    """An NF4-shaped shard: packed nibbles are uint8, statistics are float32."""
+    """An NF4-shaped shard: packed nibbles are uint8, statistics are float32.
+
+    ``::nested_offset`` is a SCALAR, and it is here because the shape production
+    actually has is what this fixture is for. Under double quantisation — the
+    default — every quantised weight carries one, 7 of the 30 tensors in a real
+    decoder-layer shard. Without it the fixture was "NF4-shaped" only in dtype,
+    and ``read_into`` shipped unable to fill a 0-dim destination at all.
+    """
     path = tmp_path / "layer_000.safetensors"
     save_file(
         {
             "self_attn.q_proj.weight": torch.randint(0, 255, (64, 32), dtype=torch.uint8),
             "self_attn.q_proj.weight::absmax": torch.rand(16, dtype=torch.float32),
+            "self_attn.q_proj.weight::nested_offset": torch.tensor(
+                0.3125, dtype=torch.float32
+            ),
             "input_layernorm.weight": torch.rand(64, dtype=torch.bfloat16),
         },
         str(path),
@@ -210,3 +220,67 @@ class TestReadIntoFillsPreallocatedTensors:
         assert bytes(flat[:surviving_bytes].numpy()) == written_prefix
         untouched_tail = flat[surviving_bytes:]
         assert torch.equal(untouched_tail, torch.full_like(untouched_tail, sentinel))
+
+
+class TestScalarTensorsAreReadable:
+    """NF4 double quantisation stores a 0-dim ``::nested_offset`` per quantised
+    weight, and ``read_into`` could not fill one: torch refuses a dtype-``view``
+    on a 0-dimensional tensor, so ``tensor.view(torch.uint8)`` raised
+    "self.dim() cannot be 0 to view Float as Byte". Nothing caught it because
+    this file's fixture and the source's had uint8 and float32 but no scalar —
+    dtype-shaped, not shape-shaped. It reached a user as a crash on the FIRST
+    layer of any 4-bit disk-tier run.
+    """
+
+    _NAME = "self_attn.q_proj.weight::nested_offset"
+
+    def test_the_header_reports_a_scalar_as_one_itemsize_at_shape_empty(self, tmp_path):
+        path = _mixed_shard(tmp_path)
+        entry = read_header(path)[self._NAME]
+        assert entry.shape == ()
+        assert entry.dtype == "float32"
+        # A scalar is one element, so its range is exactly one itemsize — the
+        # arithmetic `prod(()) == 1` has to hold for the size check in
+        # read_into to agree with a 0-dim destination's numel().
+        assert entry.nbytes == 4
+        assert entry.end - entry.start == 4
+
+    def test_safetensors_agrees_that_it_is_a_scalar(self, tmp_path):
+        """Control: the fixture really does store a 0-dim tensor, rather than a
+        1-element vector that would never exercise the defect."""
+        path = _mixed_shard(tmp_path)
+        with safe_open(path, framework="pt") as handle:
+            assert handle.get_tensor(self._NAME).dim() == 0
+        assert read_header(path)[self._NAME].shape == ()
+
+    def test_read_into_fills_a_zero_dim_destination(self, tmp_path):
+        from soup_cli.utils.safetensors_reader import read_into
+
+        path = _mixed_shard(tmp_path)
+        entry = read_header(path)[self._NAME]
+        with safe_open(path, framework="pt") as handle:
+            expected = handle.get_tensor(self._NAME).clone()
+
+        dst = torch.empty((), dtype=torch.float32, device="cpu")
+        assert dst.dim() == 0, "the destination must be 0-dim or this proves nothing"
+        with open(path, "rb") as handle:
+            read_into(handle, entry, dst)
+        assert dst.dim() == 0, "reading must not reshape the caller's tensor"
+        assert torch.equal(dst, expected)
+        assert float(dst) == pytest.approx(0.3125)
+
+    def test_the_read_writes_through_rather_than_into_a_copy(self, tmp_path):
+        """The reshape must yield a VIEW. If it ever returned a copy the read
+        would succeed, report the right byte count, and leave the caller's
+        tensor untouched — the buffer pool would then stage stale data with no
+        error anywhere."""
+        from soup_cli.utils.safetensors_reader import read_into
+
+        path = _mixed_shard(tmp_path)
+        entry = read_header(path)[self._NAME]
+        dst = torch.zeros((), dtype=torch.float32, device="cpu")
+        before = dst.data_ptr()
+        with open(path, "rb") as handle:
+            read_into(handle, entry, dst)
+        assert dst.data_ptr() == before, "the destination was reallocated"
+        assert float(dst) != 0.0, "the bytes never reached the caller's storage"

@@ -18,7 +18,16 @@ N_LAYERS = 4
 
 
 def _shards(tmp_path: Path, n_layers: int = N_LAYERS) -> str:
-    """A shard per layer, NF4-shaped: mixed uint8 and float32, plus a bf16 norm."""
+    """A shard per layer, NF4-shaped: mixed uint8 and float32, plus a bf16 norm.
+
+    ``::nested_offset`` is a SCALAR (shape ``()``), and it belongs here because
+    it is the shape production has: under double quantisation — the default —
+    every quantised weight carries one, 7 of the 30 tensors in a real
+    decoder-layer shard. This fixture was NF4-shaped in dtype only, and the
+    gap was not academic — ``read_into`` viewed to uint8 before flattening,
+    torch refuses that on a 0-dim tensor, and the whole 4-bit disk tier failed
+    on layer 0 the moment `_build_source` started using this source.
+    """
     from soup_cli.utils.layer_shard import layer_shard_path
 
     out = tmp_path / "shards"
@@ -31,6 +40,9 @@ def _shards(tmp_path: Path, n_layers: int = N_LAYERS) -> str:
                     0, 255, (64, 32), dtype=torch.uint8
                 ),
                 "self_attn.q_proj.weight::absmax": torch.rand(16, dtype=torch.float32),
+                "self_attn.q_proj.weight::nested_offset": torch.tensor(
+                    0.125 * (idx + 1), dtype=torch.float32
+                ),
                 "input_layernorm.weight": torch.rand(64, dtype=torch.bfloat16),
             },
             layer_shard_path(str(out), idx),
@@ -40,6 +52,17 @@ def _shards(tmp_path: Path, n_layers: int = N_LAYERS) -> str:
 
 def _spec(shard_dir: str):
     return RamSource.layer_specs_from_shards(shard_dir, N_LAYERS)
+
+
+def _raw_bytes(tensor):
+    """A tensor's bytes, comparable across dtypes AND ranks.
+
+    Flatten first, then view: torch refuses a dtype-``view`` on a 0-dim tensor,
+    so the bare ``tensor.view(torch.uint8)`` this file used could not compare a
+    scalar at all — the same restriction that made ``read_into`` unable to fill
+    one. Same idiom as test_issue927_safetensors_reader.py.
+    """
+    return tensor.reshape(-1).view(torch.uint8)
 
 
 class TestByteIdentityAgainstTheShippedSource:
@@ -61,8 +84,41 @@ class TestByteIdentityAgainstTheShippedSource:
                     assert mine.dtype == theirs.dtype, (idx, name)
                     assert mine.shape == theirs.shape, (idx, name)
                     assert torch.equal(
-                        mine.view(torch.uint8), theirs.view(torch.uint8)
+                        _raw_bytes(mine), _raw_bytes(theirs)
                     ), (idx, name)
+        finally:
+            ours.close()
+            shipped.close()
+
+    def test_a_scalar_sidecar_matches_disk_source_too(self, tmp_path):
+        """The shape production has, named so it cannot be lost silently.
+
+        `_shards` now carries a 0-dim `::nested_offset` beside the matrices, so
+        the parametrised gate above already covers it — but only implicitly. If
+        someone trims the fixture back, that gate goes on passing and this one
+        fails, which is the point: the whole defect was a fixture that was
+        NF4-shaped in dtype and not in rank. `DiskSource` is the reference
+        precisely because it reads through `safe_open` and never had the
+        restriction.
+        """
+        shard_dir = _shards(tmp_path)
+        spec = _spec(shard_dir)
+        scalars = [n for n, (shape, _) in spec[0].items() if shape == ()]
+        assert scalars == ["self_attn.q_proj.weight::nested_offset"], (
+            f"the fixture no longer carries exactly one scalar: {scalars}"
+        )
+        name = scalars[0]
+
+        shipped = DiskSource(shard_dir, N_LAYERS, spec)
+        ours = AsyncDiskSource(shard_dir, N_LAYERS, spec, read_ahead=2, pin=False)
+        try:
+            for idx in range(N_LAYERS):
+                theirs, mine = shipped.get(idx, name), ours.get(idx, name)
+                assert mine.shape == theirs.shape == ()
+                assert torch.equal(_raw_bytes(mine), _raw_bytes(theirs)), idx
+                # Per-layer values, so a source that staged one layer's scalar
+                # and handed it back for every layer would fail here.
+                assert float(mine) == pytest.approx(0.125 * (idx + 1))
         finally:
             ours.close()
             shipped.close()
@@ -76,8 +132,8 @@ class TestByteIdentityAgainstTheShippedSource:
             for idx in range(N_LAYERS):
                 for name in spec[idx]:
                     assert torch.equal(
-                        shallow.get(idx, name).view(torch.uint8),
-                        deep.get(idx, name).view(torch.uint8),
+                        _raw_bytes(shallow.get(idx, name)),
+                        _raw_bytes(deep.get(idx, name)),
                     )
         finally:
             shallow.close()

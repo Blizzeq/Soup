@@ -146,6 +146,16 @@ def read_into(handle: "object", entry: TensorRange, tensor: "object") -> None:
     view of the SAME memory, because ``numpy()`` refuses bfloat16 and a
     ``frombuffer`` round trip would copy.
 
+    The ``reshape(-1)`` comes BEFORE that view, and is not cosmetic: torch
+    refuses a dtype-``view`` on a 0-dimensional tensor ("self.dim() cannot be 0
+    to view Float as Byte"), and NF4 double quantisation stores a SCALAR
+    ``::nested_offset`` per quantised weight — 7 of the 30 tensors in a real
+    decoder-layer shard. Viewing first made every 4-bit layer unreadable
+    through this path. Reshaping a contiguous tensor returns a view, so the
+    uint8 flat still aliases the destination's storage and ``readinto`` writes
+    through to it; the contiguity refusal above is what keeps that true, which
+    is why it stays ahead of this line rather than being folded into it.
+
     If this raises, ``tensor`` holds undefined contents — a short read leaves
     whatever prefix bytes arrived and does not zero or roll back the rest —
     and must not be used until a later call fills it successfully.
@@ -167,7 +177,7 @@ def read_into(handle: "object", entry: TensorRange, tensor: "object") -> None:
             f"tensor {entry.name!r}: shard holds {entry.nbytes} bytes but the "
             f"destination holds {held}"
         )
-    flat = tensor.view(torch.uint8).reshape(-1)
+    flat = tensor.reshape(-1).view(torch.uint8)
     handle.seek(entry.start)
     got = handle.readinto(memoryview(flat.numpy()))
     if got != entry.nbytes:
