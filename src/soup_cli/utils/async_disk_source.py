@@ -68,6 +68,18 @@ DEFAULT_STREAM_READ_AHEAD = 2
 # limit at all, because the first thing an operator would do is delete it.
 _MAX_READ_SECONDS = 300.0
 
+# How many DISTINCT layer specs this source will stage for.
+#
+# Staging is per distinct spec, so the bound matters: an index in which every
+# layer's spec differs yields n_layers groups of one slot each, i.e. the WHOLE
+# MODEL in page-locked host memory — precisely what the disk tier exists to
+# avoid, and unbounded by `read_ahead` because a group of one takes a full slot
+# at any depth. A real model has 1-3 (decoder, embed, untied head); a hybrid
+# architecture alternating two decoder shapes has 4. Eight leaves room for a
+# shape nobody has shipped yet and still refuses the pathological one, before
+# the allocation rather than after.
+_MAX_SPEC_GROUPS = 8
+
 # How often a blocked `get` wakes to re-run its liveness checks. Not a deadline:
 # the checks below are what raise, and this only decides how promptly. A
 # consumer parked on a 40 s cold read wakes ~80 times to look at two fields.
@@ -188,6 +200,17 @@ class AsyncDiskSource:
                 members.append(0)
             members[group] += 1
             self._group_of.append(group)
+        if len(groups) > _MAX_SPEC_GROUPS:
+            raise ValueError(
+                f"layer streaming's disk tier was handed {len(groups)} distinct "
+                f"layer shapes across {self.n_layers} layers, above the "
+                f"{_MAX_SPEC_GROUPS} this source stages for. Staging is allocated "
+                f"PER SHAPE and a shape with one member takes a full slot at any "
+                f"training.stream_read_ahead, so this would page-lock most of the "
+                f"model in host memory — which is what the disk tier exists to "
+                f"avoid. A real model has 1-3 shapes (decoder, embedding, untied "
+                f"lm_head). Refusing before the allocation rather than after."
+            )
 
         # The index span each group's walk lives in. The decoder layers are one
         # contiguous run; each vocabulary weight is a group of one, where there

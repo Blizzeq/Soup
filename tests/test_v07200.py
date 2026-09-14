@@ -451,8 +451,8 @@ class TestStreamPlan:
         assert notes, plan.notes
         # The SEMANTICS, not just the key name: a note that merely mentioned
         # stream_pin would otherwise pass.
-        assert any("page-locked store" in note for note in notes), notes
-        assert any("RAM tier the run refuses" in note for note in notes), notes
+        assert any("page-locked host memory" in note for note in notes), notes
+        assert any("the run refuses" in note for note in notes), notes
 
     def test_automatic_pinning_stays_quiet(self):
         """Control: only an EXPLICIT request is worth a note. Without this a
@@ -462,15 +462,38 @@ class TestStreamPlan:
         assert plan.pinned is True
         assert self._forced_on_notes(plan) == [], plan.notes
 
-    def test_the_disk_tier_does_not_claim_a_page_locked_store(self):
-        """The forced-on note says the store IS page-locked, which is only true
-        where a RAM store exists. On the disk tier there is none, so printing it
-        there would state a promise that tier does not keep — the same
-        text-contradicts-behaviour defect this review round is about. The runtime
-        announces the inapplicability instead."""
+    def test_the_disk_tier_records_the_forced_pin_too_and_names_its_staging(self):
+        """This assertion used to be its exact inverse, and the inversion is the
+        finding. The note was withheld on the disk tier because it claimed a RAM
+        store that tier did not have, and the runtime announced the
+        inapplicability instead — but #927 gave the disk tier host staging that
+        `stream_pin` honours or refuses, and DELETED that announcement. Withheld,
+        the explicit request was recorded nowhere at all on the tier where it now
+        decides something. It must print, and it must name what this tier
+        actually page-locks."""
         plan = self._plan_with_stream_pin(True, available_ram_bytes=_NO_RAM_BYTES)
         assert plan.tier == "disk"
-        assert self._forced_on_notes(plan) == [], plan.notes
+        notes = self._forced_on_notes(plan)
+        assert notes, plan.notes
+        assert any("staging" in note for note in notes), notes
+        # And it must not have become a disk-only note: the RAM tier keeps it.
+        assert any("base store on the RAM tier" in note for note in notes), notes
+
+    def test_both_spellings_of_the_disk_tier_print_the_same_pin_prose(self):
+        """One tier, two behaviours chosen by the spelling — the defect R2 fixed
+        for the pin itself, still present in the prose that explains it.
+
+        `build_stream_plan` computes its notes from `choose_tier`'s answer,
+        BEFORE `stream_setup` forces the tier, so gating the note on
+        `tier == TIER_RAM` meant `stream_source: disk` on a RAM-sized box printed
+        a RAM-tier promise under a panel headed `tier disk`, while `auto` on a
+        RAM-poor box printed nothing. With the gate gone the note is identical
+        either way — which is only checkable because it now names both tiers.
+        """
+        fell_into = self._plan_with_stream_pin(True, available_ram_bytes=_NO_RAM_BYTES)
+        forced_from = self._plan_with_stream_pin(True)
+        assert fell_into.tier == "disk" and forced_from.tier == "ram"
+        assert self._forced_on_notes(fell_into) == self._forced_on_notes(forced_from)
 
     def test_plan_is_frozen(self):
         import dataclasses
@@ -2546,6 +2569,13 @@ _REFUSAL_STORE_SIZES = ((32, "1.07 GB"), (64, "2.15 GB"))
 #: the rewritten cases can assert it is ABSENT — a re-introduced explanation
 #: would otherwise read as a harmless extra line.
 _DISK_TIER_INAPPLICABLE_TEXT = "Pinning does not apply"
+#: Same convention as `_REFUSAL_STORE_SIZES`, for the depth the disk tier's pin
+#: refusal must quote: two values, each case asserting the OTHER is absent, so a
+#: message hardcoding one of them cannot pass. Both inside
+#: [MIN_STREAM_READ_AHEAD, MAX_STREAM_READ_AHEAD], and neither is the default —
+#: a depth equal to the default would also be satisfied by a message that fell
+#: back to it.
+_REFUSAL_READ_AHEAD_DEPTHS = (3, 4)
 
 
 class TestStreamPinRuntimeRefusal:
@@ -2563,6 +2593,11 @@ class TestStreamPinRuntimeRefusal:
                 if pin:
                     raise RuntimeError("CUDA error: cannot allocate pinned memory")
                 self.nbytes = 1
+                # The real `RamSource` reports what it actually got, and since
+                # the RAM branch of `_build_source` returns `source.pinned`
+                # rather than a literal `False`, a double that omits it is no
+                # longer a faithful stand-in.
+                self.pinned = pin
 
         monkeypatch.setattr(rt, "RamSource", _FailsWhenPinned)
         return rt
@@ -2573,6 +2608,31 @@ class TestStreamPinRuntimeRefusal:
         source, pinned = rt._build_source("d", 1, self._SPEC, True, None)
         assert pinned is False
         assert source.nbytes > 0
+
+    def test_the_returned_flag_is_read_off_the_source_on_the_ram_tier_too(
+        self, monkeypatch
+    ):
+        """`_build_source`'s docstring promises the second element "means the
+        same thing on both tiers". The disk branch returns `source.pinned`; the
+        RAM branch returned the literal it had just asked for, which is a claim
+        made at the CALL SITE about what the constructor did.
+
+        Value-identical with the real `RamSource`, which raises rather than
+        returning a pageable store under `pin=True` — so this stub is
+        counterfactual on purpose. It is the only way to tell "what the source
+        says" from "what the caller assumed", and that distinction is what the
+        docstring is asserting.
+        """
+        import soup_cli.utils.layer_stream_runtime as rt
+
+        class _SaysPageableAnyway:
+            def __init__(self, shard_dir, n_layers, spec, *, pin=True):
+                self.nbytes = 1
+                self.pinned = False
+
+        monkeypatch.setattr(rt, "RamSource", _SaysPageableAnyway)
+        _, pinned = rt._build_source("d", 1, self._SPEC, True, None)
+        assert pinned is False
 
     def test_forced_pin_refuses_instead_of_falling_back(self, monkeypatch):
         rt = self._patch_ramsource_to_fail_pinning(monkeypatch)
@@ -2685,18 +2745,31 @@ class TestDiskTierPinsItsStagingOrRefuses:
         )
         return source, pinned, console.messages, opened
 
-    def test_an_explicit_request_that_cannot_be_met_refuses(self, monkeypatch):
+    @pytest.mark.parametrize("read_ahead", _REFUSAL_READ_AHEAD_DEPTHS)
+    def test_an_explicit_request_that_cannot_be_met_refuses(
+        self, monkeypatch, read_ahead
+    ):
         """The RAM tier's contract, now the disk tier's: stream_pin=true means
         refuse, not degrade. The remedy list must include the one that is
         specific to this tier — the read-ahead depth IS the multiplier on how
-        much host memory gets page-locked."""
+        much host memory gets page-locked.
+
+        Two depths, each asserting the other is ABSENT. `assert "4" in message`
+        was a one-character check that a message hardcoding `read_ahead=4`
+        satisfied identically — the presence-not-value defect this file's own
+        `_REFUSAL_STORE_SIZES` comment spends six lines explaining.
+        """
+        others = [d for d in _REFUSAL_READ_AHEAD_DEPTHS if d != read_ahead]
         with pytest.raises(RuntimeError) as excinfo:
-            self._build_on_disk(monkeypatch, require_pin=True)
+            self._build_on_disk(monkeypatch, require_pin=True, read_ahead=read_ahead)
         message = str(excinfo.value)
         assert "training.stream_pin" in message, message
-        assert "training.stream_read_ahead" in message, message
-        assert "4" in message, ("the refusal must quote the depth it could not "
-                               f"pin, not just name the field: {message}")
+        assert f"training.stream_read_ahead={read_ahead}" in message, (
+            "the refusal must quote the depth it could not pin, not just name "
+            f"the field: {message}"
+        )
+        for other in others:
+            assert f"stream_read_ahead={other}" not in message, message
 
     def test_without_the_flag_it_falls_back_loudly_and_retries_pageable(
         self, monkeypatch

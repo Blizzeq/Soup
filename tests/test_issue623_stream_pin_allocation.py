@@ -410,8 +410,6 @@ class TestTheReadAheadDepthIsWiredAndVisible:
     given, so the printed figure can only come from what was actually passed.
     """
 
-    _DISK_YAML = "  stream_source: disk\n"
-
     def _drive_disk(self, tmp_path, monkeypatch, *, extra_training_yaml=""):
         return _drive_wiring(
             tmp_path,

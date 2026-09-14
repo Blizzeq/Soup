@@ -2301,10 +2301,18 @@ def _build_source(
                 return source, source.pinned
         source = AsyncDiskSource(shard_dir, n_layers, spec, pin=False, **open_kwargs)
         return source, source.pinned
+    # `source.pinned` on both branches rather than the literal, so the tuple's
+    # second element has ONE meaning to read off: what the source says about
+    # itself. Value-identical today — `RamSource.__init__` raises rather than
+    # returning a pageable store under pin=True — but a literal is a claim
+    # about the constructor made at the call site, which is where the disk
+    # branch's two spellings used to disagree.
     if not pin:
-        return RamSource(shard_dir, n_layers, spec, pin=False, **source_kwargs), False
+        source = RamSource(shard_dir, n_layers, spec, pin=False, **source_kwargs)
+        return source, source.pinned
     try:
-        return RamSource(shard_dir, n_layers, spec, pin=True, **source_kwargs), True
+        source = RamSource(shard_dir, n_layers, spec, pin=True, **source_kwargs)
+        return source, source.pinned
     except (RuntimeError, MemoryError) as exc:
         store_gb = _spec_bytes(spec, n_layers=n_layers) / 1e9
         if require_pin:
@@ -2328,7 +2336,8 @@ def _build_source(
             console.print(f"[yellow]{message}[/]")
         else:
             logger.warning(message)
-        return RamSource(shard_dir, n_layers, spec, pin=False, **source_kwargs), False
+        source = RamSource(shard_dir, n_layers, spec, pin=False, **source_kwargs)
+        return source, source.pinned
 
 
 def _spec_bytes(

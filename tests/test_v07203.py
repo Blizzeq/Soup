@@ -2002,6 +2002,17 @@ class TestDiskTier:
 
 #: Free RAM to report so the tiny base comfortably takes the RAM tier.
 _RAM_TIER_FREE_BYTES = 10_000_000_000
+#: Free RAM to report so the tiny base takes the DISK tier and the async
+#: reader's staging still fits. Two constraints now, not one: the store plus
+#: resident extras must EXCEED the 0.7 headroom (or `choose_tier` keeps RAM),
+#: and the staging plus those extras must fall UNDER it (or #927's host
+#: pre-flight refuses the run). Measured on this fixture at the default
+#: read_ahead 2 — staging 197,632 B, resident extras 16,640 B, store 296,448 B —
+#: which puts the window at (306,103, 447,268]. The old value here was 1000,
+#: which forced the tier by describing a box with a kilobyte of free RAM;
+#: nothing read that as a description until the staging check did, and on such
+#: a box the staging genuinely does not fit.
+_DISK_TIER_FREE_BYTES = 380_000
 #: Render width for the captured pre-flight. The plan notes arrive inside a
 #: `rich.panel.Panel`; too narrow a console wraps the measured figures across a
 #: line break and the assertions below miss text that IS on screen.
@@ -2237,7 +2248,10 @@ class TestAutoTierFallback:
         ``TestDiskTier``: the tier held nothing. Since #927 it holds the async
         reader's host staging, so the claim that distinguishes the tiers is no
         longer "nothing" but "a few layers rather than the whole model"."""
-        wrapper = self._run(tmp_path, monkeypatch, free_ram=1000, stream_source="auto")
+        wrapper = self._run(
+            tmp_path, monkeypatch,
+            free_ram=_DISK_TIER_FREE_BYTES, stream_source="auto",
+        )
         runtime = wrapper._stream_runtime
         stats = runtime.stats()
         assert runtime.tier == "disk"
@@ -2246,6 +2260,22 @@ class TestAutoTierFallback:
             "the staging must be real and a fraction of the model — "
             f"{stats['store_bytes']} of {stats['disk_bytes']} bytes"
         )
+
+    def test_a_box_too_small_for_the_readers_staging_is_refused(
+        self, tmp_path, monkeypatch
+    ):
+        """#927: the disk tier predicted ZERO host residency while the async
+        reader page-locks whole layers for the run. Driven through the REAL
+        pre-flight, not the validator alone — a check nothing calls is the #748
+        class this branch keeps finding.
+
+        1000 bytes of free RAM is the value `test_auto_falls_back_to_disk`
+        used to force the tier with; it forces it here too, and now also
+        describes a box on which the staging cannot possibly fit.
+        """
+        with pytest.raises(ValueError, match="training.stream_read_ahead") as excinfo:
+            self._run(tmp_path, monkeypatch, free_ram=1000, stream_source="auto")
+        assert "host staging" in str(excinfo.value), str(excinfo.value)
 
     def test_ram_refuses_instead_of_falling_back(self, tmp_path, monkeypatch):
         """`auto` trades speed to complete the run; `ram` is how an operator says
