@@ -447,7 +447,7 @@ challenged by this record, and 1 is the cheaper choice if host RAM is tight.
 
 ---
 
-## 8. Layer 0 at the step head is not material
+## 8. The step-head stall is the embed fetch, not layer 0 — and neither is material
 
 `_plan_queue` walks one index out of a single-member group, so a
 vocabulary-sized read is planned ahead of decoder layer 0 at the moment the

@@ -493,7 +493,7 @@ class TestTheLivenessChecksCanActuallyFire:
             exc = captured.get("exc")
             assert isinstance(exc, RuntimeError), repr(captured)
             message = str(exc)
-            assert "0.2 s limit" in message or "0 s limit" in message, message
+            assert "0 s limit" in message, message
             assert "reading layer 0" in message, message
             assert "is waiting behind it" in message, message
         finally:

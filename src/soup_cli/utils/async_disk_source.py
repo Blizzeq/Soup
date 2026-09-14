@@ -206,10 +206,12 @@ class AsyncDiskSource:
                 f"layer shapes across {self.n_layers} layers, above the "
                 f"{_MAX_SPEC_GROUPS} this source stages for. Staging is allocated "
                 f"PER SHAPE and a shape with one member takes a full slot at any "
-                f"training.stream_read_ahead, so this would page-lock most of the "
-                f"model in host memory — which is what the disk tier exists to "
-                f"avoid. A real model has 1-3 shapes (decoder, embedding, untied "
-                f"lm_head). Refusing before the allocation rather than after."
+                f"training.stream_read_ahead, so this would hold most of the "
+                f"model in host memory — page-locked when the box allows and "
+                f"pin=True, pageable otherwise — which is what the disk tier "
+                f"exists to avoid. A real model has 1-3 shapes (decoder, "
+                f"embedding, untied lm_head). Refusing before the allocation "
+                f"rather than after."
             )
 
         # The index span each group's walk lives in. The decoder layers are one
@@ -494,11 +496,17 @@ class AsyncDiskSource:
                         # Every slot in this group is still handed out. Put the
                         # request back and wait for a release: the alternative
                         # is overwriting a buffer the consumer is reading, which
-                        # is the whole defect. If no release ever comes, `get`
-                        # surfaces it as its own loud timeout rather than a
-                        # silently wrong weight reaching the device. The target
-                        # stays at the FRONT of the queue: it is still the next
-                        # thing wanted, it just has nowhere to land yet.
+                        # is the whole defect. This park is not a wedge `get`'s
+                        # two liveness checks would catch — (a) a reader thread
+                        # that exited without recording an error, (b) a single
+                        # read in flight past `_MAX_READ_SECONDS` — because
+                        # nothing is in flight here and the thread stays alive.
+                        # By design: it resumes the moment whoever holds the
+                        # slot calls `release()`, which clears `_live` and
+                        # notifies this same condition, so no check fires for
+                        # it. The target stays at the FRONT of the queue: it is
+                        # still the next thing wanted, it just has nowhere to
+                        # land yet.
                         logger.debug(
                             "layer-stream reader parked: every staging slot in "
                             "layer %d's spec group is still on loan",
