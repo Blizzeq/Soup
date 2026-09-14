@@ -115,6 +115,9 @@ def doctor(
     # GPU check
     _check_gpu()
 
+    # MLX (Apple Silicon) check
+    _check_mlx()
+
     # Resources check
     _check_resources(probe_disk=disk)
 
@@ -205,7 +208,7 @@ def doctor(
     # extra, so the suggestion keeps the declared ceilings and the platform
     # torch index instead of bare per-package floors.
     for extra_name, members in EXTRA_GROUPS:
-        group_missing = False
+        missing_pkgs: list[str] = []
         for import_name, pkg_name, min_ver in members:
             version_str = _installed_version_str(import_name, pkg_name)
             if version_str is None:
@@ -216,7 +219,7 @@ def doctor(
                     f">={min_ver}",
                     "[dim]not installed[/]",
                 )
-                group_missing = True
+                missing_pkgs.append(pkg_name)
                 continue
             max_excl = _MAX_EXCLUSIVE.get(pkg_name)
             if max_excl and _version_ge(version_str, max_excl):
@@ -232,28 +235,57 @@ def doctor(
                 issues.append(f'Upgrade {pkg_name}: pip install "{pkg_name}>={min_ver}"')
                 fix_parts.append(f'"{pkg_name}>={min_ver}"')
             table.add_row(pkg_name, escape(f"[{extra_name}]"), version_str, f">={min_ver}", status)
-        if group_missing:
+        if missing_pkgs:
+            all_missing = len(missing_pkgs) == len(members)
+            missing_list = ", ".join(missing_pkgs)
             if extra_name == "train":
                 driver = _nvidia_smi_cuda_version()
-                if driver is not None:
-                    tag = _torch_cuda_wheel_tag(driver)
-                    url = f"https://download.pytorch.org/whl/{tag}"
-                    # ``--index-url`` replaces PyPI, so torch must come from the
-                    # CUDA wheel index in its own step; the ``[train]`` extra is
-                    # then resolved against PyPI with torch already satisfied.
+                torch_missing = "torch" in missing_pkgs
+                # Single call site, gated on torch itself being missing.
+                tag = (
+                    _torch_cuda_wheel_tag(driver)
+                    if driver is not None and torch_missing
+                    else None
+                )
+                url = f"https://download.pytorch.org/whl/{tag}" if tag else None
+                if all_missing:
+                    if url is not None:
+                        # ``--index-url`` replaces PyPI, so torch must come from the
+                        # CUDA wheel index in its own step; the ``[train]`` extra is
+                        # then resolved against PyPI with torch already satisfied.
+                        issues.append(
+                            "Training stack not installed:\n"
+                            f"  pip install torch --index-url {url}\n"
+                            '  pip install "soup-cli[train]"'
+                        )
+                        fix_pre.append(f"pip install torch --index-url {url}")
+                    else:
+                        issues.append(
+                            'Training stack not installed: pip install "soup-cli[train]"'
+                        )
+                elif url is not None:
                     issues.append(
-                        "Training stack not installed:\n"
+                        f"Training stack incomplete, missing: {missing_list}\n"
                         f"  pip install torch --index-url {url}\n"
                         '  pip install "soup-cli[train]"'
                     )
                     fix_pre.append(f"pip install torch --index-url {url}")
                 else:
-                    issues.append('Training stack not installed: pip install "soup-cli[train]"')
+                    issues.append(
+                        f"Training stack incomplete, missing: {missing_list}\n"
+                        '  pip install "soup-cli[train]"'
+                    )
                 fix_parts.append('"soup-cli[train]"')
-            else:
+            elif all_missing:
                 issues.append(
                     f"{extra_name} stack not installed: "
                     f'pip install "soup-cli[{extra_name}]"'
+                )
+                fix_parts.append(f'"soup-cli[{extra_name}]"')
+            else:
+                issues.append(
+                    f"{extra_name} stack incomplete, missing: {missing_list}\n"
+                    f'  pip install "soup-cli[{extra_name}]"'
                 )
                 fix_parts.append(f'"soup-cli[{extra_name}]"')
 
@@ -322,7 +354,11 @@ def _check_config_support(config_path: str) -> None:
     pre-flight check, and the fields sitting at their schema default are not
     what anyone came here to ask about.
     """
-    from soup_cli.config.backend_support import DEFAULT_BACKEND, check_config
+    from soup_cli.config.backend_support import (
+        DEFAULT_BACKEND,
+        check_config,
+        unsupported_for,
+    )
 
     try:
         from soup_cli.config.loader import load_config
@@ -354,8 +390,10 @@ def _check_config_support(config_path: str) -> None:
         f"backend=[bold]{backend}[/]"
     )
     if not gaps:
+        known = unsupported_for(cfg.task, backend)
         console.print(
-            "  [green]Every setting this config writes is read on this backend.[/]"
+            f"  [green]None of the {len(known)} setting(s) known to be unread "
+            f"on task={cfg.task} backend={backend} is set in this config.[/]"
         )
         return
 
@@ -386,6 +424,37 @@ def _get_mlx_info() -> dict:
         return get_mlx_info()
     except Exception:  # noqa: BLE001
         return {"available": False}
+
+
+def _check_mlx():
+    """Report the MLX (Apple Silicon) backend in ``soup doctor``.
+
+    MLX is an Apple Silicon-only stack, so the panel is informational rather
+    than a pass/fail dependency: it shows the installed version and hardware
+    when present, and says so plainly when MLX is missing. It must never crash
+    the report (the info helper degrades to ``available=False`` on any error).
+    """
+    info = _get_mlx_info()
+    if info.get("available"):
+        mem_bytes = info.get("unified_memory_bytes")
+        mem_str = f"{mem_bytes / (1024**3):.0f} GB" if mem_bytes else "unknown"
+        chip = (info.get("chip") or {}).get("chip")
+        console.print(
+            Panel(
+                f"Version:  [bold green]{info.get('version') or 'unknown'}[/]\n"
+                f"Chip:     [bold]{chip or 'Apple Silicon'}[/]\n"
+                f"Memory:   [bold]{mem_str}[/] unified",
+                title="MLX",
+            )
+        )
+    elif info.get("apple_silicon"):
+        console.print(
+            Panel(
+                "Status:   [yellow]not installed[/]\n"
+                "Install:  [dim]pip install \"soup-cli\\[mlx]\"[/]",
+                title="MLX",
+            )
+        )
 
 
 def _check_gpu():

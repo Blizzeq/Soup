@@ -64,6 +64,10 @@ def _compute_distill_term(
     Averaging over padding/prompt tokens (the pre-fix behaviour) diluted the
     signal with the divergence on positions the student is not trained on.
 
+    The scalar stays in FP32 for every divergence, including half-precision
+    inputs. Non-finite logits propagate through the loss so AMP can skip an
+    overflowed step without a synchronous per-step validation guard.
+
     Raises:
         TypeError: ``temperature`` not numeric or is bool.
         ValueError: ``temperature`` non-finite or non-positive; ``divergence``
@@ -96,9 +100,13 @@ def _compute_distill_term(
         if attention_mask is not None:
             attention_mask = attention_mask[:, 1:]
 
+    # Keep the divergence kernel in FP32. In lower precision, valid logits at
+    # low temperatures readily underflow probabilities to zero; target-side
+    # derivatives in torch.kl_div then become non-finite even when the reduced
+    # loss is finite (#719).
     temp = float(temperature)
-    s = student_logits / temp
-    t = teacher_logits / temp
+    log_s = torch.log_softmax(student_logits.float() / temp, dim=-1)
+    log_t = torch.log_softmax(teacher_logits.float() / temp, dim=-1)
 
     def _masked_mean(per_token: "_torch_typ.Tensor") -> "_torch_typ.Tensor":
         """Mean of a ``(batch, seq)`` per-token divergence over trained tokens."""
@@ -112,29 +120,20 @@ def _compute_distill_term(
         denom = mask.sum().clamp(min=1.0)
         return (per_token * mask).sum() / denom
 
-    kl_div = torch.nn.functional.kl_div
     if divergence == "forward_kl":
-        # KL(teacher || student): student log-probs, teacher probs. reduction=
-        # "none" keeps per-token so we can mask before averaging.
-        log_s = torch.log_softmax(s, dim=-1)
-        p_t = torch.softmax(t, dim=-1)
-        per_token = kl_div(log_s, p_t, reduction="none").sum(dim=-1)
+        p_t = log_t.exp()
+        per_token = (p_t * (log_t - log_s)).sum(dim=-1)
         return _masked_mean(per_token) * (temp * temp)
     if divergence == "reverse_kl":
-        log_t = torch.log_softmax(t, dim=-1)
-        p_s = torch.softmax(s, dim=-1)
-        per_token = kl_div(log_t, p_s, reduction="none").sum(dim=-1)
+        p_s = log_s.exp()
+        per_token = (p_s * (log_s - log_t)).sum(dim=-1)
         return _masked_mean(per_token) * (temp * temp)
     if divergence == "js":
-        # Jensen-Shannon: 0.5 (KL(p||m) + KL(q||m)), m = 0.5 (p + q).
-        log_s = torch.log_softmax(s, dim=-1)
-        log_t = torch.log_softmax(t, dim=-1)
         p_s = log_s.exp()
         p_t = log_t.exp()
-        m = 0.5 * (p_s + p_t)
-        log_m = m.clamp(min=1e-12).log()
-        kl_pm = kl_div(log_m, p_s, reduction="none").sum(dim=-1)
-        kl_qm = kl_div(log_m, p_t, reduction="none").sum(dim=-1)
+        log_m = torch.logaddexp(log_s, log_t) - math.log(2.0)
+        kl_pm = (p_s * (log_s - log_m)).sum(dim=-1)
+        kl_qm = (p_t * (log_t - log_m)).sum(dim=-1)
         return 0.5 * (_masked_mean(kl_pm) + _masked_mean(kl_qm)) * (temp * temp)
     raise ValueError(f"Unknown divergence {divergence!r}")
 
@@ -221,7 +220,7 @@ class DistillTrainerWrapper:
     def setup(self, dataset: dict) -> None:
         """Load student + teacher, build distillation Trainer."""
         from datasets import Dataset
-        from peft import LoraConfig, TaskType, get_peft_model
+        from peft import TaskType, get_peft_model
         from transformers import (
             AutoModelForCausalLM,
             AutoTokenizer,
@@ -273,18 +272,16 @@ class DistillTrainerWrapper:
         )
 
         # LoRA on the student — bracket with v0.40.6 #67 surgical PEFT patches.
-        from soup_cli.utils.peft_wiring import resolve_lora_target_modules
+        from soup_cli.utils.peft_wiring import (
+            build_lora_config,
+            resolve_lora_target_modules,
+        )
 
         target_modules = resolve_lora_target_modules(self.model, tcfg.lora.target_modules)
-        lora_config = LoraConfig(
-            r=tcfg.lora.r,
-            lora_alpha=tcfg.lora.alpha,
-            lora_dropout=tcfg.lora.dropout,
+        lora_config = build_lora_config(
+            tcfg.lora,
             target_modules=target_modules,
             task_type=TaskType.CAUSAL_LM,
-            bias="none",
-            use_dora=tcfg.lora.use_dora,
-            use_rslora=tcfg.lora.use_rslora,
         )
         from soup_cli.utils.peft_wiring import (
             apply_post_lora_patches,
@@ -535,15 +532,11 @@ class DistillTrainerWrapper:
         class _DistillTrainer(Trainer):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
-                # compute_loss below returns a mean over its own microbatch and
-                # never divides by num_items_in_batch, which it accepts and
-                # ignores. Transformers skips its own gradient-accumulation
-                # compensation for a model it classifies as consuming loss
-                # kwargs, so leaving this True makes the accumulated gradient
-                # scale with gradient_accumulation_steps: the same effective
-                # batch split four ways gives four times the gradient. Opting
-                # out restores the division Transformers would otherwise do.
-                self.model_accepts_loss_kwargs = False
+                # compute_loss consumes Trainer's full accumulation-window
+                # target count. Keeping this True makes Trainer collect that
+                # count and skip its fixed 1 / gradient_accumulation_steps
+                # fallback, which would weight unequal microbatches equally.
+                self.model_accepts_loss_kwargs = True
 
             def compute_loss(
                 self,
@@ -557,6 +550,32 @@ class DistillTrainerWrapper:
                 labels = inputs.get("labels")
                 outputs = model(**{k: v for k, v in inputs.items() if k != "labels"})
                 student_logits = outputs.logits
+
+                def _token_weighted_accumulation(loss):
+                    """Turn this microbatch mean into its share of the window mean."""
+                    if num_items_in_batch is None or labels is None:
+                        return loss
+                    local_items = labels[..., 1:].ne(-100).sum().to(
+                        device=loss.device, dtype=loss.dtype
+                    )
+                    if torch.is_tensor(num_items_in_batch):
+                        window_items = num_items_in_batch.to(
+                            device=loss.device, dtype=loss.dtype
+                        )
+                    else:
+                        window_items = loss.new_tensor(num_items_in_batch)
+                    weighted = loss * local_items / window_items.clamp(min=1)
+
+                    # Match Trainer.compute_loss when it gathers one global
+                    # token count: DDP averages gradients, so compensate for
+                    # that average after normalising by the global denominator.
+                    if self.args.average_tokens_across_devices:
+                        loss_scale = self.accelerator.num_processes
+                        parallelism = getattr(self.accelerator, "parallelism_config", None)
+                        if parallelism is not None:
+                            loss_scale //= parallelism.tp_size
+                        weighted *= loss_scale if self.args.n_gpu <= 1 else self.args.n_gpu
+                    return weighted
 
                 ce_loss = torch.tensor(0.0, device=student_logits.device)
                 if labels is not None:
@@ -573,6 +592,7 @@ class DistillTrainerWrapper:
                 # been used (and freed) during dataset construction, so there
                 # is no teacher forward / logit term here.
                 if _sequence_mode:
+                    ce_loss = _token_weighted_accumulation(ce_loss)
                     return (ce_loss, outputs) if return_outputs else ce_loss
 
                 # v0.71.18 #257 — true on-policy MiniLLM rollout. Samples a
@@ -589,6 +609,7 @@ class DistillTrainerWrapper:
                     total = _CE_WEIGHT * ce_loss + _DISTILL_WEIGHT * rollout_loss
                     if anchor is not None:
                         total = total + anchor
+                    total = _token_weighted_accumulation(total)
                     return (total, outputs) if return_outputs else total
 
                 # v0.71.18 #258 — aligned ULD. Decode the student ids to text,
@@ -654,6 +675,7 @@ class DistillTrainerWrapper:
                         labels=labels,
                     )
                     total = _CE_WEIGHT * ce_loss + _DISTILL_WEIGHT * distill_loss
+                    total = _token_weighted_accumulation(total)
                     return (total, outputs) if return_outputs else total
 
                 # Bridge devices: HF Trainer may auto-move the student to
@@ -703,6 +725,7 @@ class DistillTrainerWrapper:
                 total = _CE_WEIGHT * ce_loss + _DISTILL_WEIGHT * distill_loss
                 if anchor is not None:
                     total = total + anchor
+                total = _token_weighted_accumulation(total)
                 return (total, outputs) if return_outputs else total
 
         # ``DataCollatorForSeq2Seq`` pads ``input_ids`` and ``attention_mask``

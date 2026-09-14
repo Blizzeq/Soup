@@ -41,6 +41,15 @@ MLX_SFT = pathlib.Path(__file__).resolve().parents[1] / (
 _WARNED_ENTRIES = [e for e in _REGISTRY[("sft", "mlx")] if e.trainer_reads]
 
 
+def _yaml_block(text: str) -> str:
+    """Normalise a caller-supplied YAML block to exactly two spaces of indent.
+
+    Accepts the block at any consistent depth, so a call site's own
+    indentation is never load-bearing.
+    """
+    return textwrap.indent(textwrap.dedent(text).strip("\n") + "\n", "  ")
+
+
 @pytest.fixture
 def config_at(tmp_path):
     """Write a soup.yaml with the given task/backend and training block."""
@@ -50,6 +59,16 @@ def config_at(tmp_path):
         train_file.write_text(
             '{"instruction": "a", "output": "b"}\n', encoding="utf-8"
         )
+        # Built by concatenation rather than by interpolating a multi-line block
+        # into a dedented f-string. In an f-string only the FIRST line of a
+        # substitution inherits the template's indentation; later lines land
+        # wherever the caller left them, and ``dedent`` then takes its common
+        # prefix from the shallowest of those. A caller block whose second line
+        # was indented differently from its first therefore shredded the whole
+        # document into a YAML parser error, and the call sites that worked did
+        # so only because their continuation lines carried the template's own
+        # indentation literally. ``dedent`` then ``indent`` normalises whatever
+        # the caller passes, at any consistent depth.
         body = textwrap.dedent(
             f"""\
             base: some-model
@@ -58,12 +77,12 @@ def config_at(tmp_path):
             data:
               train: {train_file}
               format: alpaca
-            {textwrap.indent(data, "  ") if data else ""}
-            training:
-            {textwrap.indent(training or "  epochs: 1", "  ")}
-            output: {tmp_path / "out"}
             """
         )
+        if data:
+            body += _yaml_block(data)
+        body += "training:\n" + _yaml_block(training or "epochs: 1")
+        body += f"output: {tmp_path / 'out'}\n"
         path = tmp_path / "soup.yaml"
         path.write_text(body, encoding="utf-8")
         return str(path)
@@ -185,6 +204,18 @@ def test_a_setting_the_backend_ignores_is_reported(config_at):
     assert "training.seed" in reported
 
 
+def test_new_mlx_gaps_use_liger_and_neftune_alpha_are_reported(config_at):
+    """#903: accepted-but-dropped fields must be reported, not all-cleared."""
+    from soup_cli.config.backend_support import check_config
+    from soup_cli.config.loader import load_config
+
+    cfg = load_config(
+        config_at("sft", "mlx", "  use_liger: true\n  neftune_alpha: 5")
+    )
+    reported = {e.field for e in check_config(cfg)}
+    assert {"training.use_liger", "training.neftune_alpha"} <= reported
+
+
 def test_only_fields_the_user_actually_set_are_reported(config_at):
     """Not all 275 — and not the other MLX gaps the user never touched."""
     from soup_cli.config.backend_support import check_config
@@ -290,6 +321,23 @@ def test_doctor_exits_non_zero_when_the_config_cannot_be_read(
     # 2 specifically, not merely non-zero: docs/commands.md:218 documents it,
     # and all three unreadable shapes must agree.
     assert excinfo.value.exit_code == 2
+
+
+def test_all_clear_states_what_was_checked(config_at, capsys, monkeypatch):
+    """#903: the all-clear must name its evidence, not claim a universal."""
+    from rich.console import Console
+
+    import soup_cli.commands.doctor as doctor_module
+    from soup_cli.commands.doctor import doctor
+    from soup_cli.config.backend_support import unsupported_for
+
+    monkeypatch.setattr(doctor_module, "console", Console(width=200))
+    path = config_at("sft", "mlx")
+    doctor(nccl=False, disk=False, config=path)
+
+    out = strip_ansi(capsys.readouterr().out)
+    n = len(unsupported_for("sft", "mlx"))
+    assert f"None of the {n} setting(s) known to be unread" in out
 
 
 @pytest.mark.parametrize("width", [35, 60, 200])
@@ -626,3 +674,61 @@ def test_deleting_a_warning_makes_its_entry_fail(entry, tmp_path, monkeypatch):
     problems = _registry_drift(tmp_path)
     name = entry.field.split(".", 1)[1]
     assert any(name in p and "declared read-to-warn" in p for p in problems), problems
+
+
+class TestTheFixtureDoesNotDependOnCallerIndentation:
+    """The `config_at` block must survive any consistent caller indentation.
+
+    The fixture used to interpolate a multi-line block into a dedented
+    f-string, where only the first line inherits the template's indent. A
+    caller whose second line was indented differently silently produced a
+    YAML parser error instead of the config under test -- so a test could
+    fail for a reason that had nothing to do with what it was asserting.
+    """
+
+    BLOCKS = {
+        "two-space, the natural spelling": "  use_liger: true\n  neftune_alpha: 5",
+        "zero-indent": "use_liger: true\nneftune_alpha: 5",
+        "deep and consistent": "        use_liger: true\n        neftune_alpha: 5",
+        "single line": "  use_liger: true",
+        "trailing newline": "  use_liger: true\n  neftune_alpha: 5\n",
+    }
+
+    @pytest.mark.parametrize("spelling", sorted(BLOCKS))
+    def test_every_consistent_indentation_yields_the_same_config(
+        self, config_at, spelling
+    ):
+        import yaml
+
+        raw = pathlib.Path(
+            config_at("sft", "mlx", training=self.BLOCKS[spelling])
+        ).read_text(encoding="utf-8")
+        parsed = yaml.safe_load(raw)
+
+        assert set(parsed) == {
+            "base",
+            "task",
+            "backend",
+            "data",
+            "training",
+            "output",
+        }, raw
+        expected = (
+            {"use_liger"}
+            if spelling == "single line"
+            else {"use_liger", "neftune_alpha"}
+        )
+        assert set(parsed["training"]) == expected, raw
+        assert parsed["training"]["use_liger"] is True, raw
+
+    def test_a_data_block_is_normalised_the_same_way(self, config_at):
+        import yaml
+
+        raw = pathlib.Path(
+            config_at("sft", "mlx", training="epochs: 1", data="max_length: 128")
+        ).read_text(encoding="utf-8")
+        parsed = yaml.safe_load(raw)
+
+        assert parsed["data"]["max_length"] == 128, raw
+        assert parsed["data"]["format"] == "alpaca", raw
+        assert parsed["training"]["epochs"] == 1, raw

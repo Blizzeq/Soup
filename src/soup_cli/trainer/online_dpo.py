@@ -33,6 +33,7 @@ from typing import Optional
 from rich.console import Console
 
 from soup_cli.config.schema import SoupConfig
+from soup_cli.data.chat_templates import apply_chat_template_override
 from soup_cli.utils.gpu import (
     bf16_fp16_flags,
     estimate_batch_size,
@@ -338,7 +339,7 @@ class OnlineDPOTrainerWrapper:
         the reference on demand (adapter-disable). So — unlike offline DPO — we
         do not ``get_peft_model`` here.
         """
-        from peft import LoraConfig, TaskType
+        from peft import TaskType
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         console.print(f"[dim]Loading tokenizer: {cfg.base}[/]")
@@ -347,6 +348,9 @@ class OnlineDPOTrainerWrapper:
         )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        apply_chat_template_override(
+            self.tokenizer, cfg.data.chat_template, console=console
+        )
         # Online DPO renders conversational prompts -> a chat template is
         # required. Fall back to a template WITH a generation cue when the model
         # ships none (so add_generation_prompt actually opens the assistant turn).
@@ -382,19 +386,17 @@ class OnlineDPOTrainerWrapper:
 
             self.model = prepare_model_for_kbit_training(self.model)
 
-        from soup_cli.utils.peft_wiring import resolve_lora_target_modules
+        from soup_cli.utils.peft_wiring import (
+            build_lora_config,
+            resolve_lora_target_modules,
+        )
 
         target_modules = resolve_lora_target_modules(self.model, tcfg.lora.target_modules)
 
-        self.peft_config = LoraConfig(
-            r=tcfg.lora.r,
-            lora_alpha=tcfg.lora.alpha,
-            lora_dropout=tcfg.lora.dropout,
+        self.peft_config = build_lora_config(
+            tcfg.lora,
             target_modules=target_modules,
             task_type=TaskType.CAUSAL_LM,
-            bias="none",
-            use_dora=tcfg.lora.use_dora,
-            use_rslora=tcfg.lora.use_rslora,
         )
 
         # Surgical PEFT patches operate on the base model (Gemma4 ClippableLinear).

@@ -14,6 +14,7 @@ from typing import Optional
 from rich.console import Console
 
 from soup_cli.config.schema import SoupConfig
+from soup_cli.data.chat_templates import apply_chat_template_override
 from soup_cli.utils.gpu import (
     bf16_fp16_flags,
     estimate_batch_size,
@@ -85,6 +86,10 @@ class RewardModelTrainerWrapper:
         apply_training_seed(tcfg)
 
         self._setup_transformers(cfg, tcfg)
+
+        apply_chat_template_override(
+            self.tokenizer, cfg.data.chat_template, console=console
+        )
 
         trainable, total = self.model.get_nb_trainable_parameters()
         pct = 100 * trainable / total
@@ -197,7 +202,7 @@ class RewardModelTrainerWrapper:
 
     def _setup_transformers(self, cfg: SoupConfig, tcfg) -> None:
         """Load model as AutoModelForSequenceClassification + LoRA."""
-        from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
+        from peft import TaskType, get_peft_model, prepare_model_for_kbit_training
         from transformers import (
             AutoModelForSequenceClassification,
             AutoTokenizer,
@@ -242,19 +247,17 @@ class RewardModelTrainerWrapper:
         if tcfg.quantize_reward_model and tcfg.quantization in ("4bit", "8bit", "mxfp4"):
             self.model = prepare_model_for_kbit_training(self.model)
 
-        from soup_cli.utils.peft_wiring import resolve_lora_target_modules
+        from soup_cli.utils.peft_wiring import (
+            build_lora_config,
+            resolve_lora_target_modules,
+        )
 
         target_modules = resolve_lora_target_modules(self.model, tcfg.lora.target_modules)
 
-        lora_config = LoraConfig(
-            r=tcfg.lora.r,
-            lora_alpha=tcfg.lora.alpha,
-            lora_dropout=tcfg.lora.dropout,
+        lora_config = build_lora_config(
+            tcfg.lora,
             target_modules=target_modules,
             task_type=TaskType.SEQ_CLS,
-            bias="none",
-            use_dora=tcfg.lora.use_dora,
-            use_rslora=tcfg.lora.use_rslora,
         )
         # v0.40.6 #67 — surgical PEFT patches.
         from soup_cli.utils.peft_wiring import (
