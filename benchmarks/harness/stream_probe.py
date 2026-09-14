@@ -75,8 +75,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--quant", choices=("none", "nf4"), default="nf4")
     parser.add_argument("--tier", choices=("ram", "disk"), default="ram")
-    parser.add_argument("--no-pin", action="store_true", help="pageable RAM store")
+    parser.add_argument(
+        "--no-pin",
+        action="store_true",
+        help=(
+            "pageable host memory on EITHER tier: the RAM tier's store, or the disk "
+            "tier's read-ahead staging"
+        ),
+    )
     parser.add_argument("--buffers", type=int, default=2)
+    parser.add_argument(
+        "--read-ahead",
+        type=int,
+        default=2,
+        help="layers the async disk source reads ahead (disk tier only)",
+    )
     parser.add_argument("--seq", type=int, default=512)
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--steps", type=int, default=8, help="timed steps per point")
@@ -332,7 +345,11 @@ def build(args: argparse.Namespace, device: str, dtype: str) -> Tuple[Any, ...]:
         device=device,
         dtype=dtype,
         buffers=args.buffers,
-        pin=(args.tier == "ram" and not args.no_pin),
+        read_ahead=args.read_ahead,
+        # Both tiers stage through host memory now: the RAM tier's store, the
+        # disk tier's read-ahead staging (#927). Forcing pageable on disk here
+        # would have measured the fallback path, not the shipped one.
+        pin=not args.no_pin,
         seed=args.seed,
         quant=args.quant,
         double_quant=True,
@@ -381,6 +398,11 @@ class Instruments:
     def _install_pool(self) -> None:
         import torch
 
+        # The shipped body tells the source its staging slot is free; a replica
+        # that skipped it would be refused by AsyncDiskSource at the second
+        # layer (#927) and would measure a different contract on the RAM tier.
+        from soup_cli.utils.layer_stream_runtime import _release_source
+
         pool = self.pool
         self._guard(
             type(pool),
@@ -389,6 +411,8 @@ class Instruments:
                 "stream.wait_stream(torch.cuda.current_stream())",
                 "dst.copy_(source.get(idx, name), non_blocking=True)",
                 "self.events[slot].record(stream)",
+                "_release_source(source, idx, self.events[slot])",
+                "_release_source(source, idx, None)",
             ),
         )
         inst = self
@@ -416,9 +440,11 @@ class Instruments:
                         end.record(stream)
                         inst._copy_pairs.append((start, end))
                     pool.events[slot].record(stream)
+                _release_source(source, idx, pool.events[slot])
             else:
                 for name in keys:
                     pool.buffers[slot][name].copy_(source.get(idx, name))
+                _release_source(source, idx, None)
             pool.owner[slot] = idx
             pool.loads += 1
             return slot
@@ -442,6 +468,8 @@ class Instruments:
     def _install_large_pool(self) -> None:
         import torch
 
+        from soup_cli.utils.layer_stream_runtime import _release_source
+
         large = self.large_pool
         if large is None:
             return
@@ -453,6 +481,8 @@ class Instruments:
                 "stream.wait_stream(torch.cuda.current_stream())",
                 "dst.copy_(source.get(source_idx, key), non_blocking=True)",
                 "self.event.record(stream)",
+                "_release_source(source, source_idx, self.event)",
+                "_release_source(source, source_idx, None)",
             ),
         )
         inst = self
@@ -478,8 +508,10 @@ class Instruments:
                         end.record(stream)
                         inst._copy_pairs.append((start, end))
                     large.event.record(stream)
+                _release_source(source, source_idx, large.event)
             else:
                 dst.copy_(source.get(source_idx, key))
+                _release_source(source, source_idx, None)
             large.owner = key
             large.loads += 1
 
