@@ -5223,6 +5223,25 @@ class SoupConfig(BaseModel):
                     "base layer-by-layer."
                 )
             return self
+        # #927 — `stream_source: 'ram'` INSISTS on the RAM tier: 'ram' insists,
+        # 'disk' forces, 'auto' falls back (trainer/stream_setup.py). The
+        # read-ahead reader belongs to the NVMe disk tier, so a non-default
+        # depth beside 'ram' is a setting that validates, is documented, and
+        # reaches nothing — the class of defect #748 exists to catch, and the
+        # one this very field was caught by. The DEFAULT is accepted, because a
+        # default is not a decision: refusing it would make `stream_source: ram`
+        # unusable with every config that never mentions the depth.
+        if (
+            tcfg.stream_source == "ram"
+            and tcfg.stream_read_ahead != DEFAULT_STREAM_READ_AHEAD
+        ):
+            raise ValueError(
+                f"training.stream_read_ahead={tcfg.stream_read_ahead} has no "
+                "effect with training.stream_source='ram': the read-ahead reader "
+                "belongs to the NVMe disk tier, and 'ram' never falls back to "
+                "it. Set stream_source='auto' or 'disk', or drop "
+                "stream_read_ahead."
+            )
         # v0.72.4 — the four preference losses join SFT. DPO and KTO take their
         # reference from the SAME streamed base with adapters disabled (TRL's
         # `null_ref_context`), so the reference costs no extra weights: measured
