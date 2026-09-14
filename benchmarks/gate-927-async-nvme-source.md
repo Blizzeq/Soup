@@ -263,8 +263,8 @@ The reading is unsurprising once stated: with the store cached, a synchronous
 `mmap` read is close to a `memcpy`, so there is nothing for a background reader
 to hide, and the handoff, the staging copy and the release/drain synchronisation
 are pure overhead. The async source exists for a store that does **not** fit
-RAM. When it does fit, the RAM tier is the right answer anyway — 2.2x faster
-than either disk arm here.
+RAM. When it does fit, the RAM tier is the right answer anyway — 1.9x faster
+than the synchronous disk arm and 2.2x faster than the async one.
 
 Ablation on the warm async source (2 interleaved rounds, uninstrumented):
 
@@ -305,11 +305,15 @@ reader that genuinely stalls.
 
 ## 7. `read_ahead` staging, for the operator
 
-| depth | staging on a 70B (441.43 MB/layer) | staging on a 7B (246.7 MB/layer) |
-|---|---|---|
-| 1 | 1.515 GB | 0.516 GB |
-| 2 (default) | 1.957 GB | 0.762 GB |
-| 4 | 2.839 GB | — |
+| depth | staging on the 70B fixture |
+|---|---|
+| 1 | 1.515 GB |
+| 2 (default) | 1.957 GB |
+| 4 | 2.839 GB |
+
+All three measured, read off each run's own `store` line. The 7B fixture was
+only ever run at depth 2, where it reports **0.762 GB**; the other depths are
+not tabulated for it because they were not measured.
 
 Each level costs one more decoder layer of **pinned** host memory. Since no
 depth was distinguishable on throughput here (§3), the default of 2 is not

@@ -2402,9 +2402,17 @@ class TestAutoTierFallback:
                 extra_training_yaml="  stream_vram_probe: true\n",
             )
 
-    def test_the_fallback_says_the_cost_is_unmeasured(self, tmp_path, monkeypatch):
+    def test_the_fallback_says_what_it_costs(self, tmp_path, monkeypatch):
         """A silent fallback to a slower path is the failure mode this project
-        keeps calling out; the note must not overstate what was measured."""
+        keeps calling out, so the note has to say what the fallback costs AND
+        how to refuse it.
+
+        Renamed from `..._says_the_cost_is_unmeasured`: it used to assert the
+        word "unmeasured", which was honest until #927 measured the gap
+        (benchmarks/gate-927-async-nvme-source.md). A test that pins the
+        ABSENCE of a number keeps the number out once someone goes and gets
+        it, so it now pins the presence of one instead.
+        """
         from soup_cli.utils.layer_stream import build_stream_plan
 
         plan = build_stream_plan(
@@ -2412,7 +2420,16 @@ class TestAutoTierFallback:
             available_ram_bytes=10, pinned_limit_bytes=None, disk_kind="nvme",
         )
         joined = " ".join(plan.notes)
-        assert "unmeasured" in joined and "stream_source='ram'" in joined
+        assert "stream_source='ram'" in joined, joined
+        assert "slower than the RAM tier" in joined, joined
+        # A bare claim of "slower" is what this test exists to prevent: the
+        # note must carry a figure and say where it came from.
+        assert "2.2x" in joined, joined
+        assert "gate-927-async-nvme-source.md" in joined, joined
+        # ...and it must NOT go back to promising nothing is held: the reader
+        # stages read_ahead layers in pinned host RAM.
+        assert "unmeasured" not in joined, joined
+        assert "Nothing is held resident" not in joined, joined
 
 
 def _write_tiny_tokenizer(weights_dir):

@@ -777,9 +777,12 @@ class StreamingSetupMixin:
                 notes=plan.notes
                 + (
                     "streaming from disk because stream_source='disk' was set, "
-                    "not because RAM was short. Nothing is held resident, and "
-                    "the slowdown versus the RAM tier is unmeasured on this "
-                    "hardware.",
+                    "not because RAM was short. An async reader stages "
+                    "training.stream_read_ahead layers in pinned host RAM rather "
+                    "than holding the base resident, and is slower than the RAM "
+                    "tier it is being used instead of — measured ~2.2x its step "
+                    "time with the store fully cached, on one box "
+                    "(benchmarks/gate-927-async-nvme-source.md).",
                 ),
             )
         # v0.72.3 — VRAM pre-flight. Streaming bounds the WEIGHTS; activations

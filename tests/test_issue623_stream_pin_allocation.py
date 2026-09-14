@@ -77,9 +77,10 @@ def _plain(text: str) -> str:
 
 
 #: The runtime's own summary, as distinct from the pre-flight panel printed
-#: above it. They are different statements: the panel describes the PLAN (and
-#: still says "nothing held resident", which #927 deliberately leaves to a
-#: later task), the ready line describes the source that actually got built.
+#: above it. They are different statements: the panel describes the PLAN,
+#: before any source exists, so it can only name the SHAPE of the staging;
+#: the ready line describes the source that actually got built and carries
+#: the depth and the byte count. Both are asserted, separately, below.
 _READY_MARKER = "Layer streaming ready:"
 
 
@@ -454,16 +455,32 @@ class TestTheReadAheadDepthIsWiredAndVisible:
         stages `read_ahead` layers in host memory, so that claim is now false
         and the honest figure has to be there instead.
 
-        Scoped to the ready line on purpose: the PRE-FLIGHT PANEL still says
-        "nothing held resident" (it is rendered from `plan`, before any source
-        exists), and teaching the planner about staging bytes is deferred out
-        of #927 by design. Asserting over the whole buffer would fail on that
-        deferral rather than on this line.
+        Scoped to the ready line on purpose: the pre-flight PANEL is rendered
+        from `plan`, before any source exists, so it cannot carry the byte
+        count. The test below pins what the panel says instead, so neither
+        line can quietly go back to claiming nothing is held.
         """
         _captured, panel = self._drive_disk(tmp_path, monkeypatch)
         ready = _ready_line(panel)
         assert "nothing held resident" not in ready, ready
         assert "host staging" in ready, ready
+
+    def test_the_preflight_panel_no_longer_claims_nothing_is_resident(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The panel was left saying "nothing held resident" when the ready
+        line was fixed, because the planner has no staging figure to print.
+        It still has none — but the CLAIM was wrong either way once a reader
+        began holding layers, so the panel now states the shape and leaves the
+        number to the line that has it.
+
+        Asserted over the whole captured buffer rather than the ready line,
+        because this is the one statement that is NOT on the ready line.
+        """
+        _captured, panel = self._drive_disk(tmp_path, monkeypatch)
+        plain = _plain(panel)
+        assert "nothing held resident" not in plain, plain
+        assert "staged by an async reader" in plain, plain
 
     def test_a_forced_disk_run_still_pins_its_staging(
         self, tmp_path, monkeypatch

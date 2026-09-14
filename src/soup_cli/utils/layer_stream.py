@@ -1545,10 +1545,12 @@ def build_stream_plan(
     if tier == TIER_DISK:
         # Falling back is the point of stream_source='auto', but a silent
         # fallback to a slower path is the failure mode this project keeps
-        # calling out elsewhere. Say what happened and be explicit that the
-        # slowdown is NOT quantified: safetensors memory-maps the shards, so the
-        # OS page cache blurs the RAM-vs-disk boundary, and the dev box could not
-        # produce a trustworthy gap measurement.
+        # calling out elsewhere. Say what happened, and say what it costs:
+        # benchmarks/gate-927-async-nvme-source.md measured the gap against a
+        # same-day control of the synchronous source, cold on a store larger
+        # than RAM and warm with the store fully cached. The honest summary is
+        # that the disk tier is slower than RAM either way, which is why this
+        # is a fallback and not a choice.
         if physical_budget_exceeded:
             notes.append(
                 "base exceeds the physical RAM safety ceiling — streaming from "
@@ -1567,9 +1569,14 @@ def build_stream_plan(
         else:
             notes.append(
                 "base does not fit in RAM — streaming from the NVMe disk tier "
-                "instead. Nothing is held resident, and the slowdown versus the RAM "
-                "tier is unmeasured on this hardware. Set stream_source='ram' to "
-                "refuse rather than fall back."
+                "instead. An async reader stages training.stream_read_ahead layers "
+                "in pinned host RAM rather than holding the base resident. It is "
+                "slower than the RAM tier — measured ~2.2x its step time with the "
+                "store fully cached, on one box "
+                "(benchmarks/gate-927-async-nvme-source.md); a store larger than "
+                "RAM has no RAM-tier comparison, which is what makes this a "
+                "fallback. Set stream_source='ram' to refuse rather than fall "
+                "back."
             )
     decision = decide_pinning(host_store_bytes, pinned_limit_bytes, stream_pin=stream_pin)
     # #366 review round 3 — "record, never silence". An automatic pinned store is
@@ -1604,12 +1611,16 @@ def build_stream_plan(
 def render_stream_panel(plan: StreamPlan, extra_lines: Sequence[str] = ()) -> Panel:
     """Pre-flight summary. plan 10: tell the user the cost BEFORE the run."""
     if plan.tier == TIER_DISK:
-        # "store ... (pinned)" is meaningless here: the disk tier deliberately
-        # holds nothing resident, so reporting a pinned store of 0.00 GB reads
-        # as a bug rather than as the design.
+        # `plan.store_bytes` is 0 on this tier and reporting it as a pinned
+        # store would read as a bug rather than as the design. What the disk
+        # tier does hold is the reader's staging, whose size depends on
+        # training.stream_read_ahead and is not known until the source is
+        # built — the runtime's own ready line prints it. So this says the
+        # SHAPE and leaves the number to the line that has it, rather than
+        # claiming "nothing held resident", which stopped being true in #927.
         store_line = (
             f"  base         streamed from disk across {plan.n_layers} layers, "
-            f"nothing held resident"
+            f"staged by an async reader (no resident copy)"
         )
     else:
         store_line = (
