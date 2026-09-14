@@ -131,10 +131,12 @@ class TestByteIdentityAgainstTheShippedSource:
         try:
             for idx in range(N_LAYERS):
                 for name in spec[idx]:
-                    assert torch.equal(
-                        _raw_bytes(shallow.get(idx, name)),
-                        _raw_bytes(deep.get(idx, name)),
-                    )
+                    mine, theirs = shallow.get(idx, name), deep.get(idx, name)
+                    # `_raw_bytes` flattens, so bytes alone would pass for a
+                    # source that returned the right data in the wrong shape.
+                    # The parametrised gate above keeps this; so must this.
+                    assert mine.shape == theirs.shape, (idx, name)
+                    assert torch.equal(_raw_bytes(mine), _raw_bytes(theirs))
         finally:
             shallow.close()
             deep.close()
@@ -182,6 +184,15 @@ class TestItHoldsNoMapping:
 
 class TestFailuresAreLoudAndNeverHang:
     def test_a_read_error_surfaces_at_the_get_that_wanted_it(self, tmp_path):
+        """A REAL read failure, not an injected one: the shard is gone.
+
+        It is a deletion rather than the corruption this test used to write,
+        because a shard rewritten after construction is now caught one step
+        earlier by the identity check (see
+        ``TestAShardThatChangesUnderTheRunIsRefused``) and never reaches
+        ``read_into``. A missing file fails at ``open``, which is the read path
+        proper, and is what an evicted cache or an unmounted share looks like.
+        """
         from soup_cli.utils.layer_shard import layer_shard_path
 
         shard_dir = _shards(tmp_path)
@@ -189,11 +200,56 @@ class TestFailuresAreLoudAndNeverHang:
         source = AsyncDiskSource(shard_dir, N_LAYERS, spec, read_ahead=1, pin=False)
         try:
             source.get(0, "input_layernorm.weight")
-            Path(layer_shard_path(shard_dir, 3)).write_bytes(b"corrupt")
-            with pytest.raises((OSError, ValueError)):
+            Path(layer_shard_path(shard_dir, 3)).unlink()
+            with pytest.raises(OSError, match="layer_003"):
                 for idx in range(1, N_LAYERS):
                     for name in spec[idx]:
                         source.get(idx, name)
+        finally:
+            source.close()
+
+    def test_every_later_get_raises_the_same_stored_error(self, tmp_path):
+        """Spec §Errors item 4's second half, against a REAL reader death.
+
+        The first raise is the easy half. What an operator actually meets is
+        the SECOND one, and the interesting case is a layer that is still
+        RESIDENT: ``get`` must refuse it too rather than hand back bytes from a
+        source whose reader is dead, and it must refuse with the error that
+        killed the reader rather than a fresh one about closing or progress.
+        """
+        from soup_cli.utils.layer_shard import layer_shard_path
+
+        shard_dir = _shards(tmp_path)
+        spec = _spec(shard_dir)
+        # Depth N_LAYERS so every layer has its own slot and NOTHING is
+        # evicted: the resident control below is vacuous at depth 1, where the
+        # group holds one slot and layer 0 is gone by the time layer 3 fails.
+        source = AsyncDiskSource(
+            shard_dir, N_LAYERS, spec, read_ahead=N_LAYERS, pin=False
+        )
+        try:
+            # Before the first get, so the only thing queued is the layer-0
+            # prime: the reader cannot have read layer 3 yet.
+            Path(layer_shard_path(shard_dir, 3)).unlink()
+            resident = source.get(0, "input_layernorm.weight")
+            assert resident is not None
+
+            with pytest.raises(OSError, match="layer_003") as first:
+                source.get(3, "input_layernorm.weight")
+            stored = str(first.value)
+
+            # The same layer again.
+            with pytest.raises(OSError, match="layer_003") as again:
+                source.get(3, "input_layernorm.weight")
+            assert str(again.value) == stored
+
+            # And a DIFFERENT layer, one that is still RESIDENT: it raises the
+            # stored error rather than returning its (perfectly good) bytes.
+            # The assertion above it is what stops this being vacuous.
+            assert 0 in source._slot_of, "layer 0 must still be staged"
+            with pytest.raises(OSError, match="layer_003") as other:
+                source.get(0, "input_layernorm.weight")
+            assert str(other.value) == stored
         finally:
             source.close()
 
@@ -215,7 +271,11 @@ class TestFailuresAreLoudAndNeverHang:
 
             threading.Thread(target=call, daemon=True).start()
             assert done.wait(timeout=10), "get() blocked after the reader died"
-            assert isinstance(captured.get("exc"), RuntimeError)
+            exc = captured.get("exc")
+            assert isinstance(exc, RuntimeError), repr(exc)
+            # The stored error, not "closed" and not "no progress" — a bare
+            # isinstance passes for both of those, which are different failures.
+            assert "reader died" in str(exc), str(exc)
         finally:
             source.close()
 
@@ -228,6 +288,134 @@ class TestFailuresAreLoudAndNeverHang:
         assert not source._thread.is_alive()
         with pytest.raises(RuntimeError, match="closed"):
             source.get(1, "input_layernorm.weight")
+
+    def test_close_is_a_barrier_and_drops_the_pools_events(self, tmp_path):
+        """``close()`` used to clear two fields unlocked and leave two behind.
+
+        The two it left hold the buffer pools' ``torch.cuda.Event`` objects, so
+        a closed source kept them alive; and clearing the other two outside the
+        lock let a reader that outlived the 10 s join observe a half-torn source
+        and store an ``IndexError`` that a later ``get`` reported as "list index
+        out of range" instead of "closed".
+        """
+
+        class _Event:
+            def synchronize(self):
+                pass
+
+        shard_dir = _shards(tmp_path)
+        source = AsyncDiskSource(
+            shard_dir, N_LAYERS, _spec(shard_dir), read_ahead=1, pin=False
+        )
+        event = _Event()
+        source.get(0, "input_layernorm.weight")
+        source.release(0, event)
+        assert event in source._drain, "the drain event must have been parked"
+
+        source.close()
+        assert source._slots == []
+        assert source._slot_of == {}
+        assert source._live == []
+        assert source._drain == [], "a closed source still holds a pool event"
+
+        # A release arriving after close must not resurrect anything.
+        source.release(0, event)
+        assert source._slot_of == {}
+
+    def test_a_reader_that_outlives_the_join_cannot_resurrect_a_closed_source(
+        self, tmp_path, monkeypatch
+    ):
+        """``close()``'s join has a 10 s timeout, so a reader still inside a
+        cold read outlives the teardown. Posed directly rather than waited out:
+        the flag is set and the state cleared while the reader is mid-read,
+        which is exactly the ordering a timed-out join produces.
+
+        Two properties at once — the reader must not publish into the cleared
+        ``_slot_of``, and it must not blow up on the cleared ``_slots`` (which
+        it did, storing an ``IndexError`` a later ``get`` reported as "list
+        index out of range" rather than "closed").
+        """
+        import soup_cli.utils.async_disk_source as mod
+
+        gate = threading.Event()
+        real = mod.read_into
+
+        def held(handle, entry, dst):
+            assert gate.wait(timeout=10.0), "the test never released the reader"
+            real(handle, entry, dst)
+
+        monkeypatch.setattr(mod, "read_into", held)
+        shard_dir = _shards(tmp_path)
+        source = AsyncDiskSource(
+            shard_dir, N_LAYERS, _spec(shard_dir), read_ahead=1, pin=False
+        )
+        try:
+            deadline = time.monotonic() + 10.0
+            while source._in_flight is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert source._in_flight == 0, "the reader never started layer 0"
+
+            with source._ready:
+                source._closed = True
+                source._slots = []
+                source._slot_of = {}
+                source._live = []
+                source._drain = []
+            gate.set()
+            source._thread.join(timeout=10.0)
+            assert not source._thread.is_alive()
+            assert source._slot_of == {}, "the reader published into a closed source"
+            assert source._error is None, repr(source._error)
+        finally:
+            gate.set()
+            source.close()
+
+    def test_a_reader_waiting_on_a_drain_survives_the_teardown_too(self, tmp_path):
+        """The other side of the same window, and the one that actually bit.
+
+        A reader parked in ``draining.synchronize()`` has NOT yet resolved its
+        staging slot. If it resolves it after the teardown it indexes an empty
+        list, and the ``IndexError`` is stored as the source's error — so the
+        next ``get`` reports "list index out of range" where it should report
+        "closed". No ``read_into`` stub here: the block is a drain event whose
+        ``synchronize`` waits, which is the real shape of the 10 s join timing
+        out on a cold shard.
+        """
+        gate = threading.Event()
+
+        class _SlowEvent:
+            def synchronize(self):
+                assert gate.wait(timeout=10.0), "the test never released the drain"
+
+        shard_dir = _shards(tmp_path)
+        source = AsyncDiskSource(
+            shard_dir, N_LAYERS, _spec(shard_dir), read_ahead=1, pin=False
+        )
+        try:
+            source.get(0, "input_layernorm.weight")
+            source.release(0, _SlowEvent())
+            with source._ready:
+                source._queue = [1]
+                source._ready.notify_all()
+
+            deadline = time.monotonic() + 10.0
+            while source._in_flight != 1 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert source._in_flight == 1, "the reader never took layer 1"
+
+            with source._ready:
+                source._closed = True
+                source._slots = []
+                source._slot_of = {}
+                source._live = []
+                source._drain = []
+            gate.set()
+            source._thread.join(timeout=10.0)
+            assert not source._thread.is_alive()
+            assert source._error is None, repr(source._error)
+        finally:
+            gate.set()
+            source.close()
 
     def test_a_spec_that_disagrees_with_the_header_is_refused(self, tmp_path):
         shard_dir = _shards(tmp_path)
@@ -244,6 +432,290 @@ class TestFailuresAreLoudAndNeverHang:
                 AsyncDiskSource(shard_dir, N_LAYERS, spec, read_ahead=bad, pin=False)
         with pytest.raises(ValueError, match="must be an int"):
             AsyncDiskSource(shard_dir, N_LAYERS, spec, read_ahead=True, pin=False)
+
+
+def _get_on_a_thread(source, idx, name, timeout=20.0):
+    """Call ``get`` where a REGRESSION fails the test instead of hanging it.
+
+    Every test below drives a reader that is deliberately wedged or dead. If
+    the liveness checks stop working, a direct ``get`` would block the whole
+    suite forever; on a worker thread it times out and the assertion names it.
+    """
+    done = threading.Event()
+    captured = {}
+
+    def call():
+        try:
+            captured["value"] = source.get(idx, name)
+        except BaseException as exc:  # noqa: BLE001 — recorded for the assert
+            captured["exc"] = exc
+        done.set()
+
+    threading.Thread(target=call, daemon=True).start()
+    assert done.wait(timeout=timeout), (
+        f"get({idx}, {name!r}) never returned — the liveness checks in "
+        f"AsyncDiskSource.get did not fire"
+    )
+    return captured
+
+
+class TestTheLivenessChecksCanActuallyFire:
+    """The guard this replaced could not fire, and that was the whole problem.
+
+    The old conjunction required ``idx`` to be in none of ``_queue`` /
+    ``_in_flight`` / ``_slot_of``, but the demand push puts it in the queue
+    before the wait and the reader moves it through those three states under
+    the lock — so on the single-consumer path it was always in exactly one of
+    them. Dead code standing where the spec names its anti-hang mitigation: a
+    wedged reader made these very tests HANG rather than fail.
+    """
+
+    def test_a_read_that_never_returns_is_refused_by_the_limit(
+        self, tmp_path, monkeypatch
+    ):
+        """The reachable wedge. A reader blocked inside ``read_into`` keeps the
+        layer legitimately in flight, so no amount of state-inspection can tell
+        it from a slow read — only elapsed time can."""
+        import soup_cli.utils.async_disk_source as mod
+
+        blocked = threading.Event()
+
+        def never_returns(handle, entry, dst):
+            blocked.wait(timeout=30.0)
+
+        monkeypatch.setattr(mod, "read_into", never_returns)
+        monkeypatch.setattr(mod, "_MAX_READ_SECONDS", 0.25)
+
+        shard_dir = _shards(tmp_path)
+        source = AsyncDiskSource(shard_dir, N_LAYERS, _spec(shard_dir), pin=False)
+        try:
+            captured = _get_on_a_thread(source, 0, "input_layernorm.weight")
+            exc = captured.get("exc")
+            assert isinstance(exc, RuntimeError), repr(captured)
+            message = str(exc)
+            assert "0.2 s limit" in message or "0 s limit" in message, message
+            assert "reading layer 0" in message, message
+            assert "is waiting behind it" in message, message
+        finally:
+            blocked.set()
+            source.close()
+
+    def test_a_slow_read_under_the_limit_is_not_refused(self, tmp_path, monkeypatch):
+        """The control that makes the limit a wedge detector rather than a
+        timeout: a read that is slow but finishes must still be served."""
+        import soup_cli.utils.async_disk_source as mod
+
+        real = mod.read_into
+
+        def slow(handle, entry, dst):
+            time.sleep(0.2)
+            real(handle, entry, dst)
+
+        monkeypatch.setattr(mod, "read_into", slow)
+        monkeypatch.setattr(mod, "_MAX_READ_SECONDS", 5.0)
+
+        shard_dir = _shards(tmp_path)
+        source = AsyncDiskSource(shard_dir, N_LAYERS, _spec(shard_dir), pin=False)
+        try:
+            captured = _get_on_a_thread(source, 0, "input_layernorm.weight")
+            assert "exc" not in captured, repr(captured["exc"])
+            assert captured["value"] is not None
+        finally:
+            source.close()
+
+    def test_a_reader_thread_that_exits_silently_is_refused(
+        self, tmp_path, monkeypatch
+    ):
+        """A backstop, and it is labelled one in the docstring: no path in the
+        shipped ``_run`` can exit without ``_fail`` or ``_closed``. It exists
+        for the paths that are not in that file — this monkeypatch stands in
+        for a future second ``return`` or a thread killed from outside."""
+        monkeypatch.setattr(AsyncDiskSource, "_run", lambda self: None)
+
+        shard_dir = _shards(tmp_path)
+        source = AsyncDiskSource(shard_dir, N_LAYERS, _spec(shard_dir), pin=False)
+        try:
+            assert source._error is None, "the reader must have said nothing"
+            captured = _get_on_a_thread(source, 0, "input_layernorm.weight")
+            exc = captured.get("exc")
+            assert isinstance(exc, RuntimeError), repr(captured)
+            message = str(exc)
+            assert "exited without recording an error" in message, message
+            assert "layer 0 still wanted" in message, message
+        finally:
+            source.close()
+
+
+class TestAShardThatChangesUnderTheRunIsRefused:
+    """Headers are parsed once; the file is re-opened per read.
+
+    ``read_into`` checks how many bytes arrived, never that they came from the
+    same file, so a shard replaced in place by one of the SAME SIZE and a
+    different layout was read at stale offsets and trained on with no error
+    anywhere. ``layer_shard`` re-shards into the same directory with
+    ``os.replace`` whenever the base's fingerprint moves, and this source keeps
+    no handle to block that, so the window is the whole run.
+    """
+
+    @staticmethod
+    def _rewrite_same_size(path: Path) -> None:
+        """Flip one DATA byte and bump mtime; size, inode and device unchanged.
+
+        Deliberately still a valid safetensors file of the same length: the
+        point is that a file which is perfectly readable is refused because it
+        is not the file whose byte ranges this source holds. That also leaves
+        mtime as the only field that differs, which pins the weakest of the
+        four rather than letting size carry the test.
+        """
+        import os
+
+        data = bytearray(path.read_bytes())
+        data[-1] ^= 0xFF
+        was = path.stat()
+        path.write_bytes(bytes(data))
+        os.utime(path, ns=(was.st_mtime_ns + 10**9, was.st_mtime_ns + 10**9))
+        assert path.stat().st_size == was.st_size, "the rewrite changed the size"
+        assert path.stat().st_mtime_ns != was.st_mtime_ns
+
+    def test_a_same_size_rewrite_is_refused_by_name(self, tmp_path):
+        from soup_cli.utils.layer_shard import layer_shard_path
+
+        shard_dir = _shards(tmp_path)
+        spec = _spec(shard_dir)
+        source = AsyncDiskSource(shard_dir, N_LAYERS, spec, read_ahead=1, pin=False)
+        try:
+            source.get(0, "input_layernorm.weight")
+            self._rewrite_same_size(Path(layer_shard_path(shard_dir, 3)))
+            with pytest.raises(RuntimeError, match="changed on disk since its header"):
+                for idx in range(1, N_LAYERS):
+                    for name in spec[idx]:
+                        source.get(idx, name)
+        finally:
+            source.close()
+
+    def test_the_check_runs_before_the_read_so_a_truncation_says_what_happened(
+        self, tmp_path
+    ):
+        """A SHORTER replacement used to surface as "short read", which names
+        the symptom. The identity check runs first and names the cause."""
+        from soup_cli.utils.layer_shard import layer_shard_path
+
+        shard_dir = _shards(tmp_path)
+        spec = _spec(shard_dir)
+        source = AsyncDiskSource(shard_dir, N_LAYERS, spec, read_ahead=1, pin=False)
+        try:
+            source.get(0, "input_layernorm.weight")
+            Path(layer_shard_path(shard_dir, 3)).write_bytes(b"corrupt")
+            with pytest.raises(RuntimeError, match="changed on disk since its header"):
+                for idx in range(1, N_LAYERS):
+                    for name in spec[idx]:
+                        source.get(idx, name)
+        finally:
+            source.close()
+
+    def test_an_unchanged_shard_never_trips_it(self, tmp_path):
+        """The control. Every layer, twice, forward then backward — the reader
+        re-opens each shard on every read, so a check that compared the wrong
+        thing would fire here."""
+        shard_dir = _shards(tmp_path)
+        spec = _spec(shard_dir)
+        source = AsyncDiskSource(shard_dir, N_LAYERS, spec, read_ahead=2, pin=False)
+        try:
+            for sweep in (range(N_LAYERS), reversed(range(N_LAYERS))):
+                for idx in sweep:
+                    for name in spec[idx]:
+                        assert source.get(idx, name) is not None
+        finally:
+            source.close()
+
+
+class TestPinnedStagingRefusesAnUnreleasedBorrowWithoutAGpu:
+    """The CPU-runnable half of Task 5's safety contract.
+
+    The CUDA class below needs a card because the HAZARD is a draining device
+    copy. The REFUSAL does not: it reads ``self.pinned``, a plain attribute.
+    Without this class every test that runs in CI constructs with
+    ``pin=False``, so deleting the refusal branch outright left CI green —
+    and that branch is the difference between a silently wrong gradient and a
+    loud stop.
+    """
+
+    @staticmethod
+    def _as_if_pinned(tmp_path):
+        """Pageable staging that reports itself pinned.
+
+        ``pin=True`` would need a CUDA device to allocate; the branch under
+        test never looks at the memory, only at the flag. The mirror image of
+        ``TestPinningRefusesPageableMemory``, which monkeypatches the other way.
+        """
+        shard_dir = _shards(tmp_path)
+        source = AsyncDiskSource(
+            shard_dir, N_LAYERS, _spec(shard_dir), read_ahead=2, pin=False
+        )
+        source.pinned = True
+        return source
+
+    def test_a_second_get_without_release_is_refused(self, tmp_path):
+        source = self._as_if_pinned(tmp_path)
+        try:
+            source.get(0, "input_layernorm.weight")
+            with pytest.raises(RuntimeError, match="release") as excinfo:
+                source.get(1, "input_layernorm.weight")
+            message = str(excinfo.value)
+            assert "_release_source" in message, message
+            assert "0" in message and "1" in message, message
+        finally:
+            source.close()
+
+    def test_the_compliant_sequence_is_unaffected(self, tmp_path):
+        source = self._as_if_pinned(tmp_path)
+        try:
+            first = source.get(0, "input_layernorm.weight")
+            source.release(0, None)
+            second = source.get(1, "input_layernorm.weight")
+            assert second.shape == first.shape
+        finally:
+            source.close()
+
+    def test_the_pageable_control_still_takes_the_implicit_release(self, tmp_path):
+        """Genuinely ``pin=False``: the same sequence must NOT raise, or the
+        refusal is a block on all traffic rather than on the hazard."""
+        shard_dir = _shards(tmp_path)
+        source = AsyncDiskSource(
+            shard_dir, N_LAYERS, _spec(shard_dir), read_ahead=2, pin=False
+        )
+        try:
+            assert not source.pinned
+            source.get(0, "input_layernorm.weight")
+            assert source.get(1, "input_layernorm.weight") is not None
+        finally:
+            source.close()
+
+    def test_the_refusal_orders_layers_numerically(self, tmp_path, monkeypatch):
+        """Operator-facing text: ``sorted`` over the STRINGS prints "10, 2".
+
+        Two simultaneous borrows cannot be reached through ``get`` — the first
+        unreleased one is what the refusal is about — so the reader is stubbed
+        out and the state posed directly. ``_hold`` is a pure function of it.
+        """
+        monkeypatch.setattr(AsyncDiskSource, "_run", lambda self: None)
+        shard_dir = _shards(tmp_path, n_layers=12)
+        spec = RamSource.layer_specs_from_shards(shard_dir, 12)
+        source = AsyncDiskSource(shard_dir, 12, spec, read_ahead=8, pin=False)
+        try:
+            source.pinned = True
+            flat = source._group_slots[0]
+            assert len(flat) >= 2, flat
+            source._slot_of = {2: flat[0], 10: flat[1]}
+            source._live[flat[0]] = True
+            source._live[flat[1]] = True
+            with source._ready:
+                with pytest.raises(RuntimeError, match="release") as excinfo:
+                    source._hold(1)
+            message = str(excinfo.value)
+            assert "layer(s) 2, 10" in message, message
+        finally:
+            source.close()
 
 
 # ==========================================================================
@@ -341,28 +813,37 @@ class TestTheDeviceGetsTheLayerItAskedFor:
         n_layers = 8
         shard_dir = _uniform_shards(tmp_path, n_layers, 8 * 1024 * 1024)
         spec = RamSource.layer_specs_from_shards(shard_dir, n_layers)
-        for source in (
-            DiskSource(shard_dir, n_layers, spec),
-            RamSource(shard_dir, n_layers, spec, pin=True),
+        # Built one at a time and closed: `DiskSource` holds a `safe_open`
+        # mapping per layer, and on Windows a live mapping keeps the file open
+        # against `tmp_path` cleanup — the very situation #926 is about.
+        for make in (
+            lambda: DiskSource(shard_dir, n_layers, spec),
+            lambda: RamSource(shard_dir, n_layers, spec, pin=True),
         ):
-            pool = LayerBufferPool(spec[0], n_buffers=2, device="cuda")
-            stream = torch.cuda.Stream()
-            prefetcher = StreamPrefetcher(pool, source, n_layers, stream)
-            hog = torch.randn(4096, 4096, device="cuda")
-            for _ in range(200):
-                hog = hog @ hog.clamp(-1, 1)
-            seen = []
-            prefetcher.prime()
-            for idx in range(n_layers):
-                buffers = pool.wait(idx)
-                prefetcher.advance(idx)
-                seen.append(buffers["w"].clone())
-            torch.cuda.synchronize()
-            for idx, got in enumerate(seen):
-                assert torch.unique(got).tolist() == [idx], (
-                    f"{type(source).__name__} layer {idx} is wrong — the harness, "
-                    f"not the source under test, is at fault"
-                )
+            source = make()
+            try:
+                pool = LayerBufferPool(spec[0], n_buffers=2, device="cuda")
+                stream = torch.cuda.Stream()
+                prefetcher = StreamPrefetcher(pool, source, n_layers, stream)
+                hog = torch.randn(4096, 4096, device="cuda")
+                for _ in range(200):
+                    hog = hog @ hog.clamp(-1, 1)
+                seen = []
+                prefetcher.prime()
+                for idx in range(n_layers):
+                    buffers = pool.wait(idx)
+                    prefetcher.advance(idx)
+                    seen.append(buffers["w"].clone())
+                torch.cuda.synchronize()
+                for idx, got in enumerate(seen):
+                    assert torch.unique(got).tolist() == [idx], (
+                        f"{type(source).__name__} layer {idx} is wrong — the "
+                        f"harness, not the source under test, is at fault"
+                    )
+            finally:
+                close = getattr(source, "close", None)
+                if close is not None:
+                    close()
 
     def test_pinned_is_measured_not_asserted(self, tmp_path):
         """``pinned=True`` must mean the staging really is page-locked.

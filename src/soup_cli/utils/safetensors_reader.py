@@ -56,6 +56,45 @@ _ITEMSIZE: Dict[str, int] = {
 
 
 @dataclass(frozen=True)
+class ShardIdentity:
+    """Which FILE a set of byte ranges was read off.
+
+    ``read_header`` closes the file, so between the parse and every later read
+    there is no handle, no inode pin and no fingerprint — and ``read_into``
+    checks how many bytes arrived, never that they came from the same file.
+    A shard replaced in place by one of the SAME SIZE and a different layout
+    therefore reads at stale offsets and trains on garbage with no error
+    anywhere. ``layer_shard`` re-shards into the same directory with
+    ``os.replace`` whenever the base's fingerprint moves, so the window is the
+    whole run rather than a microsecond.
+
+    Four fields because no one of them is sufficient: size alone misses a
+    same-size rewrite, mtime alone misses a preserved timestamp, and
+    ``(ino, dev)`` alone misses an in-place rewrite that keeps the inode.
+    This type only REPORTS identity; the policy and the message belong to the
+    caller that knows what the file is for.
+    """
+
+    size: int
+    mtime_ns: int
+    ino: int
+    dev: int
+
+
+def identity_of(handle: "object") -> ShardIdentity:
+    """The identity of the file behind an OPEN handle (``os.fstat``, not a path).
+
+    Taking it off the handle rather than the path is what makes it atomic with
+    the bytes read through that handle: a path-based ``stat`` could describe a
+    different file than the one the caller is about to read.
+    """
+    st = os.fstat(handle.fileno())
+    return ShardIdentity(
+        size=st.st_size, mtime_ns=st.st_mtime_ns, ino=st.st_ino, dev=st.st_dev
+    )
+
+
+@dataclass(frozen=True)
 class TensorRange:
     """One tensor's identity and its ABSOLUTE byte range in the shard."""
 
@@ -72,8 +111,19 @@ class TensorRange:
 
 def read_header(path: str) -> Dict[str, TensorRange]:
     """Every tensor in ``path``, with absolute byte ranges. Never maps the file."""
-    size = os.path.getsize(path)
+    return read_header_with_identity(path)[0]
+
+
+def read_header_with_identity(path: str) -> Tuple[Dict[str, TensorRange], ShardIdentity]:
+    """``read_header``, plus the identity of the file the ranges were read off.
+
+    The identity comes from an ``os.fstat`` on the SAME handle the header is
+    read through, so a caller that keeps the ranges for the rest of a run can
+    prove, at every later open, that it is still addressing the file it parsed.
+    """
     with open(path, "rb") as handle:
+        identity = identity_of(handle)
+        size = identity.size
         raw_length = handle.read(8)
         if len(raw_length) != 8:
             raise ValueError(f"{path}: header is truncated (not even a length field)")
@@ -141,7 +191,7 @@ def read_header(path: str) -> Dict[str, TensorRange]:
         entries[name] = TensorRange(
             name=name, dtype=dtype, shape=shape, start=start, end=end
         )
-    return entries
+    return entries, identity
 
 
 def read_into(handle: "object", entry: TensorRange, tensor: "object") -> None:

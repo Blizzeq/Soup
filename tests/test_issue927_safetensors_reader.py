@@ -174,6 +174,51 @@ class TestHeaderRefusesRatherThanGuesses:
         assert "shape.safetensors" in str(excinfo.value)
 
 
+class TestTheIdentityOfTheFileTheRangesCameOff:
+    """``read_header`` closes the file; a caller that keeps the ranges for a
+    whole run needs to be able to prove, at every later open, that it is still
+    addressing the file it parsed."""
+
+    def test_it_agrees_with_a_plain_stat_of_the_same_file(self, tmp_path):
+        import os
+
+        from soup_cli.utils.safetensors_reader import read_header_with_identity
+
+        path = _mixed_shard(tmp_path)
+        entries, identity = read_header_with_identity(path)
+        st = os.stat(path)
+        assert identity.size == st.st_size
+        assert identity.mtime_ns == st.st_mtime_ns
+        assert identity.ino == st.st_ino
+        assert identity.dev == st.st_dev
+        # And the header half is unchanged: `read_header` is this function.
+        assert entries == read_header(path)
+
+    def test_a_same_size_rewrite_produces_a_different_identity(self, tmp_path):
+        """Size alone is not identity — this is the case it misses, and the one
+        that reads at stale offsets with no error anywhere."""
+        import os
+
+        from soup_cli.utils.safetensors_reader import read_header_with_identity
+
+        path = Path(_mixed_shard(tmp_path))
+        _, before = read_header_with_identity(str(path))
+        data = bytearray(path.read_bytes())
+        data[-1] ^= 0xFF
+        path.write_bytes(bytes(data))
+        os.utime(path, ns=(before.mtime_ns + 10**9, before.mtime_ns + 10**9))
+        _, after = read_header_with_identity(str(path))
+        assert after.size == before.size, "the rewrite must not change the size"
+        assert after != before
+
+    def test_it_is_frozen(self, tmp_path):
+        from soup_cli.utils.safetensors_reader import read_header_with_identity
+
+        _, identity = read_header_with_identity(_mixed_shard(tmp_path))
+        with pytest.raises(Exception):
+            identity.size = 1
+
+
 def test_tensor_range_is_frozen():
     entry = TensorRange(name="w", dtype="float32", shape=(2,), start=0, end=8)
     with pytest.raises(Exception):

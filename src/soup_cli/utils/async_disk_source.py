@@ -25,20 +25,53 @@ that does not block the Python thread at all. Measured through the real pool
 before ``release`` existed: 7 of 8 layers reached the device holding another
 layer's weights at ``read_ahead=1``, 6 of 8 at the default 2, 4 of 8 at 4.
 
+One layer spec group is assumed to occupy a CONTIGUOUS run of indices, which
+is what ``_build_source`` produces: the decoder layers in order, then the
+vocabulary-sized shards one group each. ``_group_bounds`` takes a group's span
+from its lowest and highest index, so on a synthetic index whose groups
+alternate the span is wider than the membership and the effective lookahead
+window halves. That costs depth, never correctness — no wedge, no wrong bytes.
+
 NO top-level torch: this module is imported by the trainer path only.
 """
 
 import logging
 import threading
+import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
-from soup_cli.utils.safetensors_reader import TensorRange, read_header, read_into
+from soup_cli.utils.safetensors_reader import (
+    ShardIdentity,
+    TensorRange,
+    identity_of,
+    read_header_with_identity,
+    read_into,
+)
 
 logger = logging.getLogger(__name__)
 
 MIN_STREAM_READ_AHEAD = 1
 MAX_STREAM_READ_AHEAD = 8
 DEFAULT_STREAM_READ_AHEAD = 2
+
+# How long ONE layer's read may be in flight before `get` calls it a wedge.
+#
+# Derived from the measurement, not guessed. `benchmarks/gate-927-async-nvme-
+# source.md` §8 and `benchmarks/results/probe-rtx5070/layer0_wait_cold_synth70b
+# _nf4.json` are the only per-layer record: over 478 load brackets on the cold
+# 70B-shaped fixture the slowest SINGLE one is 874 ms (the vocabulary matrix on
+# its first touch), against a 313-363 ms mean. Ten times that is 8.7 s, so the
+# 300 s floor is what binds — and it binds with room: this project's own
+# worst-case source rate is 22 MB/s (the module docstring above), which is ~20 s
+# for one 441 MB decoder layer, so 300 s is ~15x the slowest read anyone here
+# has measured. A limit that fires on a merely slow read would be worse than no
+# limit at all, because the first thing an operator would do is delete it.
+_MAX_READ_SECONDS = 300.0
+
+# How often a blocked `get` wakes to re-run its liveness checks. Not a deadline:
+# the checks below are what raise, and this only decides how promptly. A
+# consumer parked on a 40 s cold read wakes ~80 times to look at two fields.
+_LIVENESS_POLL_SECONDS = 0.5
 
 
 def _spec_key(layer_spec: Mapping[str, Tuple[Tuple[int, ...], str]]) -> tuple:
@@ -55,7 +88,15 @@ def _spec_key(layer_spec: Mapping[str, Tuple[Tuple[int, ...], str]]) -> tuple:
 
 
 class AsyncDiskSource:
-    """Read layers ahead on a background thread; ``get`` hands over the result."""
+    """Read layers ahead on a background thread; ``get`` hands over the result.
+
+    ONE consumer thread. ``get`` is not safe to call concurrently from two,
+    and the failure is a wedge rather than an error: each demand push REPLACES
+    the queue, so two consumers would drop each other's request in turn and
+    neither would ever be served. The shipped consumer is ``StreamPrefetcher``
+    on the compute thread, which is single-threaded by construction; nothing
+    here enforces it, so a second caller is a caller bug.
+    """
 
     def __init__(
         self,
@@ -92,10 +133,15 @@ class AsyncDiskSource:
 
         # Headers once, up front: a shard that disagrees with the index would
         # otherwise read the right byte count from the wrong offsets and train
-        # on garbage with no error.
+        # on garbage with no error. Each header's file identity comes with it,
+        # so the same failure arriving LATER — a shard replaced in place while
+        # the run holds these ranges — is refused at the next open rather than
+        # read at stale offsets (see ShardIdentity).
         self._ranges: List[Dict[str, TensorRange]] = []
+        self._identities: List[ShardIdentity] = []
         for idx in range(self.n_layers):
-            header = read_header(self._paths[idx])
+            header, identity = read_header_with_identity(self._paths[idx])
+            self._identities.append(identity)
             for name, (shape, dtype) in self._layer_specs[idx].items():
                 entry = header.get(name)
                 if entry is None:
@@ -201,6 +247,9 @@ class AsyncDiskSource:
         self._queue: List[int] = [0]
         self._slot_of: Dict[int, int] = {}
         self._in_flight: Optional[int] = None
+        # Set and cleared in lockstep with `_in_flight`, under the lock, so the
+        # two can never disagree about which layer has been in flight how long.
+        self._read_started_at: Optional[float] = None
         self._next_slot: List[int] = [0] * len(self._group_slots)
         # Per staging slot: handed to the consumer and not released yet, and
         # the event that says when its copy has drained.
@@ -342,9 +391,14 @@ class AsyncDiskSource:
         ]
         if borrowed and self.pinned:
             layer_in_slot = {held: lay for lay, held in self._slot_of.items()}
-            on_loan = sorted(
-                str(layer_in_slot[slot]) for slot in borrowed if slot in layer_in_slot
-            )
+            # Sort the layer NUMBERS, then stringify: sorting the strings puts
+            # "10" before "2" in operator-facing text.
+            on_loan = [
+                str(layer)
+                for layer in sorted(
+                    layer_in_slot[slot] for slot in borrowed if slot in layer_in_slot
+                )
+            ]
             raise RuntimeError(
                 f"layer-stream staging for layer(s) {', '.join(on_loan) or '?'} "
                 f"is still on loan: get() handed it out and release() was never "
@@ -422,6 +476,11 @@ class AsyncDiskSource:
                         # silently wrong weight reaching the device. The target
                         # stays at the FRONT of the queue: it is still the next
                         # thing wanted, it just has nowhere to land yet.
+                        logger.debug(
+                            "layer-stream reader parked: every staging slot in "
+                            "layer %d's spec group is still on loan",
+                            idx,
+                        )
                         self._ready.wait(timeout=1.0)
                         continue
                     self._queue.pop(0)
@@ -429,6 +488,14 @@ class AsyncDiskSource:
                     draining = self._drain[slot_index]
                     self._drain[slot_index] = None
                     self._in_flight = idx
+                    self._read_started_at = time.monotonic()
+                    # Resolved HERE, under the lock that claimed it: `close()`
+                    # empties `_slots` after a join that can time out, and the
+                    # reader must not index a list the closer has cleared —
+                    # the IndexError lands in `_error` and a later `get`
+                    # reports "list index out of range" instead of "closed".
+                    # The dict stays alive through this local reference.
+                    slot = self._slots[slot_index]
                 # OUTSIDE the lock: the compute thread must be able to call
                 # get() while this waits. The event was recorded on a stream
                 # that already waited on the compute stream, so it depends only
@@ -437,13 +504,33 @@ class AsyncDiskSource:
                 # safe rather than a deadlock.
                 if draining is not None:
                     draining.synchronize()
-                slot = self._slots[slot_index]
                 with open(self._paths[idx], "rb") as handle:
+                    # The ranges were taken minutes or hours ago off a file this
+                    # source deliberately does not keep open. A same-size
+                    # replacement would otherwise be read at stale offsets and
+                    # trained on with no error anywhere; only a SHORTER one
+                    # surfaces, as a short read.
+                    found = identity_of(handle)
+                    if found != self._identities[idx]:
+                        raise RuntimeError(
+                            f"{self._paths[idx]}: layer {idx}'s shard changed on "
+                            f"disk since its header was read — the byte ranges "
+                            f"this source holds no longer describe it. Refusing "
+                            f"rather than reading at stale offsets, which would "
+                            f"train on whatever is now at those bytes. Re-shard "
+                            f"and restart, and do not re-shard a base while a "
+                            f"run is reading it."
+                        )
                     for name, dst in slot.items():
                         read_into(handle, self._ranges[idx][name], dst)
                 with self._ready:
-                    self._slot_of[idx] = slot_index
                     self._in_flight = None
+                    self._read_started_at = None
+                    # Not after close(): the closer clears `_slot_of` under this
+                    # same lock once the join returns, and re-populating it
+                    # would resurrect a slot whose buffers are gone.
+                    if not self._closed:
+                        self._slot_of[idx] = slot_index
                     self._ready.notify_all()
         except BaseException as exc:  # noqa: BLE001 — handed to the consumer
             self._fail(exc)
@@ -453,6 +540,7 @@ class AsyncDiskSource:
         with self._ready:
             self._error = exc
             self._in_flight = None
+            self._read_started_at = None
             self._ready.notify_all()
 
     def _note_direction(self, idx: int) -> None:
@@ -536,10 +624,16 @@ class AsyncDiskSource:
                     if self._queue:
                         self._ready.notify_all()
                     return tensor
-                # Asking for a layer that is not resident ends any implicit hold
-                # on the others, so the reader always has a slot to claim. This
-                # is what keeps a release-unaware consumer from deadlocking a
-                # reader that now refuses to overwrite a live slot.
+                # Asking for a layer that is not resident takes the SAME branch
+                # `_hold` takes on a hit, and it is the branch that matters:
+                # under PAGEABLE staging it ends the implicit hold on the other
+                # slots, so the reader always has one to claim and a
+                # release-unaware consumer cannot deadlock a reader that refuses
+                # to overwrite a live slot; under PINNED staging it REFUSES,
+                # because a copy out of an unreleased buffer is still draining
+                # and recycling it is the corruption `release` exists to
+                # prevent. Missing rather than hitting changes nothing about
+                # that split — see `_hold`.
                 self._hold(idx)
                 if self._in_flight != idx and (
                     not self._queue or self._queue[0] != idx
@@ -550,19 +644,63 @@ class AsyncDiskSource:
                     # have is the plan being wrong, not a reason to finish it.
                     self._queue = [idx]
                     self._ready.notify_all()
-                self._ready.wait(timeout=30.0)
-                if (
-                    self._error is None
-                    and not self._closed
-                    and idx not in self._slot_of
-                    and self._in_flight != idx
-                    and idx not in self._queue
-                ):
-                    raise RuntimeError(
-                        f"layer-stream reader made no progress on layer {idx} for "
-                        f"30 s. Refusing rather than blocking: a training run that "
-                        f"stops without an error is worse than one that fails."
-                    )
+                self._ready.wait(timeout=_LIVENESS_POLL_SECONDS)
+                self._check_the_reader_is_making_progress(idx)
+
+    def _check_the_reader_is_making_progress(self, idx: int) -> None:
+        """Raise if the reader cannot serve ``idx``. Lock held.
+
+        This replaces a guard that could not fire. The old one required ``idx``
+        to be in none of ``_queue`` / ``_in_flight`` / ``_slot_of``, and the
+        demand push two lines above puts it in ``_queue`` before the wait while
+        the reader moves it queue -> ``_in_flight`` -> ``_slot_of`` under this
+        lock — so on the single-consumer path it was always in exactly one of
+        them and the conjunction was never true. It was the spec's NAMED
+        mitigation for the spec's named risk ("a background thread in the
+        training loop is new surface for a hang"), and it was dead: a wedged
+        reader made the suite HANG instead of fail.
+
+        Two checks, each for a state that really is reachable:
+
+        * The reader thread is gone and said nothing. A backstop, deliberately:
+          ``_run`` is one ``try`` around the whole loop whose only ``return`` is
+          guarded by ``self._closed``, and every other exit runs ``_fail``, so
+          the thread cannot exit with ``_error`` unset and ``_closed`` False
+          through any path in this file. It exists for the ones that are not in
+          this file — a monkeypatched ``_run`` in a test, a future edit adding a
+          second ``return``, an interpreter that kills the thread — where the
+          alternative is a consumer blocking forever on a reader that is not
+          there.
+        * One read has been in flight past ``_MAX_READ_SECONDS``. THIS is the
+          reachable wedge: a reader blocked inside ``read_into`` (a stalled
+          drive, a disconnected network path) keeps ``idx`` legitimately
+          queued, so no amount of state-inspection can tell it from a slow
+          read — only elapsed time can. The stamp covers the drain wait as well
+          as the read itself, because it is taken with ``_in_flight``: both are
+          time the consumer spends unable to proceed, and charging the wider
+          window errs towards firing, which is the safe direction for a
+          hang detector carrying a 15x margin.
+        """
+        if self._error is None and not self._closed and not self._thread.is_alive():
+            raise RuntimeError(
+                f"layer-stream reader thread exited without recording an error, "
+                f"with layer {idx} still wanted. Refusing rather than blocking: a "
+                f"training run that stops without an error is worse than one that "
+                f"fails."
+            )
+        started = self._read_started_at
+        if started is None:
+            return
+        elapsed = time.monotonic() - started
+        if elapsed > _MAX_READ_SECONDS:
+            raise RuntimeError(
+                f"layer-stream reader has been reading layer {self._in_flight} for "
+                f"{elapsed:.0f} s, past the {_MAX_READ_SECONDS:.0f} s limit (layer "
+                f"{idx} is waiting behind it). The slowest single layer read ever "
+                f"measured on this tier is 0.874 s, so this is a wedged read, not a "
+                f"slow one. Refusing rather than blocking: a training run that stops "
+                f"without an error is worse than one that fails."
+            )
 
     def release(self, idx: int, event: Any = None) -> None:
         """Say the consumer is done reading layer ``idx`` out of its staging slot.
@@ -592,7 +730,16 @@ class AsyncDiskSource:
             self._ready.notify_all()
 
     def close(self) -> None:
-        """Stop the reader and release the staging buffers. Idempotent."""
+        """Stop the reader and release the staging buffers. Idempotent.
+
+        The teardown runs UNDER the lock, and drops four things rather than two.
+        The join has a timeout, so a reader still inside a cold read outlives
+        this call; clearing shared state unlocked let that reader observe a
+        half-torn source and store an ``IndexError`` a later ``get`` would
+        report as "list index out of range" instead of "closed". ``_live`` and
+        ``_drain`` go too: they hold the buffer pools' ``torch.cuda.Event``
+        objects, and a closed source has no business keeping them alive.
+        """
         with self._ready:
             if self._closed:
                 return
@@ -600,8 +747,11 @@ class AsyncDiskSource:
             self._ready.notify_all()
         if self._thread.is_alive():
             self._thread.join(timeout=10.0)
-        self._slots = []
-        self._slot_of = {}
+        with self._ready:
+            self._slots = []
+            self._slot_of = {}
+            self._live = []
+            self._drain = []
 
     def __del__(self) -> None:
         try:
