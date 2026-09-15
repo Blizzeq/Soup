@@ -24,6 +24,17 @@ a real corpus:
   between consecutive steps, and against the corpus-wide busiest quartile. A
   persisted hot set is only useful if the set is stable; this is the number that
   says whether it is.
+* **one-layer-ahead predictability** — the share of layer K+1's TRAFFIC that
+  would have been caught by prefetching (a) the set layer K itself just used, or
+  (b) layer K+1's corpus-wide busiest quartile. This is the precondition for any
+  throughput claim, and it costs nothing once the indices are captured: today's
+  prefetcher is a PERFECT predictor because the layer walk is deterministic,
+  while which experts a layer needs is unknown until its router has run. Expert
+  granularity trades a perfect prefetch for a conditional one, and these two
+  numbers say what the conditional one would be worth. **Read them only where
+  coverage is well below 1.0** — when nearly every expert is touched, "layer K's
+  used set" is nearly every expert and a hit rate near 1.0 says only that
+  prefetching everything works, which is what the layer tier already does.
 
 No Soup import: this is a model-and-corpus measurement that must run against a
 stock transformers install, and keeping it standalone means a reader can check it
@@ -283,6 +294,22 @@ def jaccard(left: set, right: set) -> float:
     return len(left & right) / len(left | right)
 
 
+def traffic_hit_rate(counts: Sequence[int], prefetched: set) -> float:
+    """Share of a layer's ASSIGNMENTS that land on an already-prefetched expert.
+
+    Weighted by traffic rather than by expert, because a prefetch that catches
+    the busiest experts and misses three idle ones has done its job.
+    """
+    total = sum(counts)
+    if total <= 0:
+        return 1.0
+    return sum(value for expert, value in enumerate(counts) if expert in prefetched) / total
+
+
+def used_set(counts: Sequence[int]) -> set:
+    return {expert for expert, value in enumerate(counts) if value > 0}
+
+
 # =====================================================================
 # The measurement
 # =====================================================================
@@ -293,6 +320,7 @@ class LayerStats:
     counts: List[int]
     coverage: List[float] = field(default_factory=list)
     per_step_hot: List[set] = field(default_factory=list)
+    per_step_counts: List[List[int]] = field(default_factory=list)
 
 
 def measure_shape(
@@ -327,6 +355,7 @@ def measure_shape(
             touched = int((torch.tensor(counted) > 0).sum().item())
             entry.coverage.append(touched / n_experts)
             entry.per_step_hot.append(hot_set(counted))
+            entry.per_step_counts.append(counted)
             for expert, value in enumerate(counted):
                 entry.counts[expert] += value
         used_steps += 1
@@ -337,6 +366,32 @@ def summarise(
     stats: Sequence[LayerStats], n_experts: int, top_k: int, tokens: int
 ) -> Dict[str, Any]:
     baseline = uniform_coverage(n_experts, top_k, tokens)
+    # Could the experts of layer K+1 be prefetched while layer K computes?
+    # Two candidate predictors, both free from what is already captured:
+    # the set layer K itself just used, and layer K+1's corpus-wide busiest
+    # quartile (what a persisted heat file would hold). Both are reported as
+    # the share of layer K+1's TRAFFIC they would have caught.
+    #
+    # READ THESE ONLY WHERE COVERAGE IS WELL BELOW 1.0. When almost every
+    # expert is touched, "layer K's used set" is almost every expert, so a hit
+    # rate near 1.0 says nothing except that prefetching everything works --
+    # which is what the layer tier already does.
+    ahead: Dict[int, Dict[str, float]] = {}
+    for index in range(1, len(stats)):
+        previous, current = stats[index - 1], stats[index]
+        global_hot = hot_set(current.counts)
+        from_previous, from_heat, set_overlap = [], [], []
+        for step in range(min(len(previous.per_step_counts), len(current.per_step_counts))):
+            previous_used = used_set(previous.per_step_counts[step])
+            from_previous.append(traffic_hit_rate(current.per_step_counts[step], previous_used))
+            from_heat.append(traffic_hit_rate(current.per_step_counts[step], global_hot))
+            set_overlap.append(jaccard(previous_used, used_set(current.per_step_counts[step])))
+        if from_previous:
+            ahead[current.layer] = {
+                "traffic_caught_by_previous_layers_set": sum(from_previous) / len(from_previous),
+                "traffic_caught_by_corpus_hot25": sum(from_heat) / len(from_heat),
+                "used_set_jaccard_with_previous_layer": sum(set_overlap) / len(set_overlap),
+            }
     layers = []
     for entry in stats:
         global_hot = hot_set(entry.counts)
@@ -361,12 +416,27 @@ def summarise(
                     sum(step_to_step) / len(step_to_step) if step_to_step else None
                 ),
                 "hot25_jaccard_to_global": sum(to_global) / len(to_global),
+                "one_layer_ahead": ahead.get(entry.layer),
                 "counts": entry.counts,
             }
         )
     coverages = [one["coverage_mean"] for one in layers]
     ginis = [one["gini"] for one in layers]
+    caught = [
+        one["one_layer_ahead"]["traffic_caught_by_previous_layers_set"]
+        for one in layers
+        if one["one_layer_ahead"]
+    ]
+    heat = [
+        one["one_layer_ahead"]["traffic_caught_by_corpus_hot25"]
+        for one in layers
+        if one["one_layer_ahead"]
+    ]
     return {
+        "traffic_caught_by_previous_layers_set_mean": (
+            sum(caught) / len(caught) if caught else None
+        ),
+        "traffic_caught_by_corpus_hot25_mean": sum(heat) / len(heat) if heat else None,
         "tokens_per_step": tokens,
         "uniform_baseline_coverage": baseline,
         "coverage_mean_over_layers": sum(coverages) / len(coverages),
