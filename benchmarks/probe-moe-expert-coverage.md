@@ -186,7 +186,9 @@ exposes a `*TopKRouter` module returning `(router_logits, router_scores,
 router_indices)` with integer indices of shape `(tokens, top_k)`. The harness
 hooks anything of that shape, falls back to taking `topk` of a float
 `(tokens, num_experts)` output itself, and **refuses by name** rather than
-guessing if neither holds.
+guessing if neither holds. The order of the tuple deliberately does not matter,
+and that is not a hypothetical: `granitemoe` puts the indices first where the
+other three put them last.
 
 Tokens are **packed, not padded**: the corpus is tokenised into one stream and
 sliced into exact `seq`-length chunks. A padded batch routes its PAD positions
@@ -208,7 +210,15 @@ Validated 2026-09-15 before any real model was downloaded
 - the predictability numbers exist for every layer but the first, are bounded in
   [0, 1], and - the discriminating one - the corpus-hot-quartile hit rate never
   exceeds that layer's own top-25% traffic share, which it cannot by the
-  definition of the hot set and would only do if the arithmetic were wrong.
+  definition of the hot set and would only do if the arithmetic were wrong;
+- **and the same end-to-end run against a tiny `granitemoe`**, which is the
+  check that shape-based discovery is not just a nicer way of writing an
+  architecture table. `granitemoe`'s router returns
+  `(top_k_index, top_k_weights, router_logits)` - the indices FIRST - where
+  olmoe, qwen3_moe and mixtral all return `(router_logits, router_scores,
+  router_indices)` with the indices last. A table keyed on position would have
+  read granite's indices as logits; scanning for the integer tensor whose last
+  dimension is `top_k` reads both correctly, and the counts add up on both.
 
 **One correction, kept because it is the point.** A first version of the
 validation asserted that 512 tokens over 8 experts "must reach coverage 1.0, as
