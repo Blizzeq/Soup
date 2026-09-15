@@ -323,3 +323,60 @@ class TestOnRealHardware:
         assert before >= 4 * 2**26
         recover_from_failed_page_lock(device="cuda", console=None)
         assert cached_bytes() < before
+
+
+@requires_cuda
+class TestTheProbeCallsAnOutOfMemoryAcceleratorErrorAnOom:
+    """#649's shape inside the #349 instrument. Under WDDM the allocator has often
+    already spilled, so the out-of-memory surfaces later, at a synchronise, as
+    ``AcceleratorError("CUDA error: out of memory")`` rather than as
+    ``torch.OutOfMemoryError``. That is a RESULT — the shape does not fit — and
+    the probe filed it as an instrument failure that "may have poisoned the
+    context". Both refuse the run; only the OOM verdict tells the operator what
+    to change (batch or max_length). In the report, with the probe on, this is
+    exactly the message the reporter got."""
+
+    @staticmethod
+    def _model_raising(exc):
+        class _Model:
+            def __call__(self, **kwargs):
+                raise exc
+
+            @staticmethod
+            def parameters():
+                return iter(())
+
+        return _Model()
+
+    def test_an_out_of_memory_accelerator_error_is_an_oom_verdict_not_a_failure(self):
+        import torch
+
+        from soup_cli.utils.layer_stream_runtime import measure_step_peak_bytes
+
+        peak = measure_step_peak_bytes(
+            self._model_raising(torch.AcceleratorError("CUDA error: out of memory")),
+            rows=1,
+            seq_len=8,
+            vocab_size=32,
+        )
+        assert peak is not None
+        assert peak.oom is True
+        assert peak.failed is False
+
+    def test_any_other_accelerator_error_is_still_an_instrument_failure(self):
+        import torch
+
+        from soup_cli.utils.layer_stream_runtime import measure_step_peak_bytes
+
+        peak = measure_step_peak_bytes(
+            self._model_raising(
+                torch.AcceleratorError("CUDA error: an illegal memory access was encountered")
+            ),
+            rows=1,
+            seq_len=8,
+            vocab_size=32,
+        )
+        assert peak is not None
+        assert peak.failed is True
+        assert peak.oom is False
+        assert peak.error == "AcceleratorError"
