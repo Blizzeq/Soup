@@ -1126,7 +1126,76 @@ def _build_streamed_layer_class():
                     return tensor
                 return fn(tensor)
 
-            return super()._apply(_skip_meta, recurse=recurse)
+            # #1005 — `named_children()` below no longer lists `inner`, and
+            # torch's `_apply` recurses over `children()`, so the inner layer's
+            # OWN parameters and buffers (none on a decoder layer today, but
+            # not a contract) would be skipped. Reach it explicitly.
+            if recurse:
+                self.inner._apply(_skip_meta, recurse=True)
+            return super()._apply(_skip_meta, recurse=False)
+
+        # ------------------------------------------------------------------
+        # #1005 — the wrapper's NAMES are canonical, not only its KEYS.
+        #
+        # v0.72.1 made `state_dict()` write `...layers.0.self_attn...` (below)
+        # while `named_modules()` / `named_parameters()` still said
+        # `...layers.0.inner.self_attn...` — two spellings of one tensor. That
+        # was harmless while every consumer joined keys to keys. peft 0.21
+        # selects the adapter entries STRUCTURALLY: it collects key prefixes
+        # from `named_modules()` (every tuner layer's attribute names) and keeps
+        # the `state_dict()` entries under them — prefixes built from one
+        # spelling, applied to the other, so a streamed adapter saved as ZERO
+        # tensors with no exception (9 CI cells, every PR, the day 0.21.0 was
+        # published). transformers' `get_parameter_names` — the weight-decay
+        # grouping — walks `named_children()` and joins the result with
+        # `named_parameters()`, the same hazard one consumer over.
+        #
+        # So the inner layer's subtree is reported at THIS wrapper's prefix,
+        # and the wrapper itself is NOT enumerated — `named_modules()` yields
+        # the inner layer under the wrapper's own name and then its children;
+        # `named_children()` yields the inner layer's children. The wrapper
+        # stays reachable where the tree is walked structurally (`children()`
+        # of the container, `get_submodule`, attribute access), which is what
+        # `train()` / `apply()` / `_apply()` go through. Enumerating the
+        # wrapper TOO would be worse than either: it is attribute-transparent
+        # (`__getattr__` below), so transformers' `_set_gradient_checkpointing`
+        # — `hasattr(module, "gradient_checkpointing")` then `setattr` over
+        # `modules()` — would answer on the wrapper and land the write on it,
+        # and a name-keyed patcher (`utils/gradient_ckpt.py`) would patch two
+        # objects under one name. `named_parameters()` / `named_buffers()` /
+        # `parameters()` derive from `named_modules()` and become canonical
+        # with it. What still uses `_modules` directly — `load_state_dict`'s
+        # recursion, `__repr__`, the `children()`-based traversals — is
+        # handled explicitly: the load-side pre-hook above keeps redirecting
+        # canonical keys into `.inner.`, and the three traversals below reach
+        # `inner` themselves. Naming only: nothing on the streamed forward
+        # path changes, so the bit-exactness gates stay valid un-re-run.
+        # ------------------------------------------------------------------
+        def named_children(self) -> Any:
+            yield from self.inner.named_children()
+
+        def named_modules(
+            self, memo: Any = None, prefix: str = "", remove_duplicate: bool = True
+        ) -> Any:
+            if memo is None:
+                memo = set()
+            if remove_duplicate:
+                if self in memo:
+                    return
+                memo.add(self)
+            yield from self.inner.named_modules(memo, prefix, remove_duplicate)
+
+        def train(self, mode: bool = True) -> Any:
+            if not isinstance(mode, bool):
+                raise ValueError("training mode is expected to be boolean")
+            self.training = mode
+            self.inner.train(mode)
+            return self
+
+        def apply(self, fn: Any) -> Any:
+            self.inner.apply(fn)
+            fn(self)
+            return self
 
         def state_dict(
             self,
@@ -1150,12 +1219,14 @@ def _build_streamed_layer_class():
             # LoRA run.
             #
             # Serialisation-only, deliberately: the forward path is untouched,
-            # so v0.72.0's bit-exactness gates remain valid. The cost is that
-            # `named_parameters()` still shows `.inner.`, which is why
-            # `canonical_named_parameters()` below exists. `--resume` /
-            # `--hf-resume` load INTO a streamed model fine (v0.72.3,
-            # `train.py`): a separate load-side pre-hook redirects canonical
-            # keys at load time, mirroring this save-side delegation.
+            # so v0.72.0's bit-exactness gates remain valid. Until #1005 the
+            # cost was that `named_parameters()` still showed `.inner.` (which
+            # is why `canonical_named_parameters()` below existed); since #1005
+            # the naming methods above agree with these keys, and that helper
+            # is an identity kept for its callers. `--resume` / `--hf-resume`
+            # load INTO a streamed model fine (v0.72.3, `train.py`): a separate
+            # load-side pre-hook redirects canonical keys at load time,
+            # mirroring this save-side delegation.
             #
             # The wrapper owns no parameters or buffers of its own — they all
             # live on `inner` — so nothing is lost by not serialising it. It
@@ -1281,7 +1352,43 @@ def _build_streamed_large_layer_class():
             def _skip_meta(tensor: Any) -> Any:
                 return tensor if getattr(tensor, "is_meta", False) else fn(tensor)
 
-            return super()._apply(_skip_meta, recurse=recurse)
+            # #1005 — `named_children()` no longer lists `inner`; reach it
+            # explicitly (its `weight` is the meta placeholder `_skip_meta`
+            # passes through).
+            if recurse:
+                self.inner._apply(_skip_meta, recurse=True)
+            return super()._apply(_skip_meta, recurse=False)
+
+        # #1005 — canonical NAMES, mirroring StreamedDecoderLayer: the inner
+        # module (an Embedding or a Linear, which owns `weight` directly) is
+        # enumerated under this wrapper's own prefix in place of the wrapper,
+        # so `named_parameters()` says `model.embed_tokens.weight` exactly as
+        # `state_dict()` does.
+        def named_children(self) -> Any:
+            yield from self.inner.named_children()
+
+        def named_modules(
+            self, memo: Any = None, prefix: str = "", remove_duplicate: bool = True
+        ) -> Any:
+            if memo is None:
+                memo = set()
+            if remove_duplicate:
+                if self in memo:
+                    return
+                memo.add(self)
+            yield from self.inner.named_modules(memo, prefix, remove_duplicate)
+
+        def train(self, mode: bool = True) -> Any:
+            if not isinstance(mode, bool):
+                raise ValueError("training mode is expected to be boolean")
+            self.training = mode
+            self.inner.train(mode)
+            return self
+
+        def apply(self, fn: Any) -> Any:
+            self.inner.apply(fn)
+            fn(self)
+            return self
 
         def state_dict(
             self,
@@ -1350,13 +1457,13 @@ def _replace_module_references(root: Any, target: Any, replacement: Any) -> int:
 
 
 def canonical_named_parameters(model: Any) -> Iterator[Tuple[str, Any]]:
-    """Yield ``(name, param)`` with the wrapper's ``.inner.`` segment stripped,
-    matching the spelling ``StreamedDecoderLayer.state_dict()`` already uses
-    (v0.72.1). ``named_parameters()`` on a streamed model is not canonical on
-    its own: every wrapped layer's parameters carry an extra ``.inner.``
-    segment that a resident (non-streamed) model of the same checkpoint does
-    not, so a name-keyed comparison between the two sees no overlap unless it
-    goes through this function first.
+    """Yield ``(name, param)`` with any wrapper ``.inner.`` segment stripped,
+    matching the spelling ``StreamedDecoderLayer.state_dict()`` uses (v0.72.1).
+
+    Since #1005 a streamed model's ``named_parameters()`` is canonical on its
+    own (the wrapper reports the inner layer's tree at its own prefix), so this
+    is an identity for it; it is kept for its callers and for any tree that
+    still nests a wrapped module under a child named ``inner``.
     """
     for name, param in model.named_parameters():
         yield name.replace(".inner.", "."), param
