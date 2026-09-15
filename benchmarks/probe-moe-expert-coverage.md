@@ -113,8 +113,31 @@ output exists. Expert-granularity therefore trades a perfect prefetch for a
 conditional one, and a reader that must wait for the router is a reader that
 stalls. Colibrì's answer is a lookahead that predicts the next layer's experts
 from the current one (they report 71.6% one layer ahead). **That predictability
-is NOT measured in step 0**, and until it is, a "C <= 0.50" result licenses
-scheduling the feature's *design*, not a throughput claim.
+is measured in step 0 after all**, and until the numbers are in, a "C <= 0.50"
+result licenses scheduling the feature's *design*, not a throughput claim.
+
+
+**So step 0 measures it, because it is free once the router indices are
+captured.** Two candidate predictors, each reported as the share of layer K+1's
+*traffic* it would have caught - weighted by assignments, not by expert, since a
+prefetch that catches the busiest experts and misses three idle ones has done
+its job:
+
+- **the set layer K itself just used** - the cheapest possible lookahead, no
+  model, no training, available the moment layer K's router has run;
+- **layer K+1's corpus-wide busiest quartile** - what a persisted per-dataset
+  heat file would hold, i.e. the hybrid tier's own predictor.
+
+A fourth row of the rule follows: **if neither predictor catches most of the
+traffic, the read-win branch is not reachable even at low coverage**, because
+the reader would have to wait for each router before it could fetch. What is
+still NOT measured is a *learned* predictor of the kind the C engine reports;
+these two are the free lower bound on what one could be worth.
+
+**These numbers are only interpretable where coverage is well below 1.0.** If
+nearly every expert is touched, "layer K's used set" is nearly every expert and
+a hit rate near 1.0 says only that prefetching everything works - which is what
+the layer tier already does. The harness says so at the point of use.
 
 ## 3. What is measured, and on what
 
@@ -152,7 +175,10 @@ is context-dependent and a 4x512 step is not a 1x2048 step.
 ## 4. The instrument, and what was done to trust it
 
 `benchmarks/harness/moe_expert_coverage.py`, standalone (no Soup import, so it
-runs against a stock transformers install).
+runs against a stock transformers install). Per layer it reports union
+coverage, routing skew (Gini plus the share taken by the busiest 10/25/50% of
+experts), hot-set stability (Jaccard of the busiest quartile between steps and
+against the corpus), and the two one-layer-ahead prefetch hit rates above.
 
 Router discovery is by SHAPE rather than an architecture table: in transformers
 5.17 every MoE decoder — olmoe, qwen3_moe, mixtral, granitemoe, deepseek\* —
@@ -178,7 +204,11 @@ Validated 2026-09-15 before any real model was downloaded
   shape it returns nothing rather than inventing an answer;
 - **the arithmetic identity that is the real check**: the per-expert counts must
   sum to exactly `tokens x top_k x steps` at every layer. They do, at 3 layers x
-  2 shapes. That is what proves no token was dropped or double-counted.
+  2 shapes. That is what proves no token was dropped or double-counted;
+- the predictability numbers exist for every layer but the first, are bounded in
+  [0, 1], and - the discriminating one - the corpus-hot-quartile hit rate never
+  exceeds that layer's own top-25% traffic share, which it cannot by the
+  definition of the hot set and would only do if the arithmetic were wrong.
 
 **One correction, kept because it is the point.** A first version of the
 validation asserted that 512 tokens over 8 experts "must reach coverage 1.0, as
@@ -218,8 +248,10 @@ exists.*
   stated rather than hidden: **the largest expert count measured here is 64**,
   and a 128- or 256-expert model at the same token budget would have a LOWER
   chance baseline and could behave differently.
-- **One-layer-ahead expert predictability** — the precondition named in §2 for
-  any throughput claim.
+- **A learned one-layer-ahead predictor.** Step 0 measures the two FREE
+  predictors instead: the previous layer's own used set, and a corpus-wide heat
+  quartile. They bound from below what a learned one could be worth, without
+  training anything.
 - **Any timing.** The forward runs with a hook on every router and, in the CPU
   control, at no throughput anybody should quote.
 - **Backward routing.** Only the forward's router decisions are observed; the
