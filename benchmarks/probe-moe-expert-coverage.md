@@ -50,7 +50,7 @@ uniformly, the expected coverage is
 ```
 
 For OLMoE's 64 experts / top-8 at T = 512 tokens that is `1 - (7/8)^512`, which
-is `1 - 10^-29.8`. **Chance alone predicts coverage indistinguishable from
+is `1 - 10^-29.7`. **Chance alone predicts coverage indistinguishable from
 100%.** Even a single sequence of 512 tokens is far more than enough to touch
 every expert if routing is anywhere near uniform.
 
@@ -61,6 +61,33 @@ in §5 is printed beside this baseline, and the harness computes it.
 This also sets the bar honestly: for the read to fall by half, routing must be
 concentrated enough that half the experts see **no token at all** out of 512 —
 roughly 4,096 assignments landing on at most 32 of 64 experts.
+
+### The baseline across the whole family, computed before any model was loaded
+
+Pure arithmetic from the formula above, so it needs no hardware and no download,
+and it is what makes the bar concrete. The last two columns are the token budget
+at which uniform routing would reach 50% and 99% coverage.
+
+| model | E | k | baseline at T=512 | at T=2048 | T for 50% | T for 99% |
+|---|---|---|---|---|---|---|
+| `OLMoE-1B-7B` (measured here) | 64 | 8 | 1 - 10^-29.7 | 1 - 10^-119 | 5.2 | 34 |
+| `granite-3.0-1b-a400m` (measured here) | 32 | 8 | 1 - 10^-64.0 | 1 - 10^-256 | 2.4 | 16 |
+| `Qwen3-30B-A3B` (plan; not measured, §7) | 128 | 8 | 1 - 10^-14.4 | 1 - 10^-57 | 10.7 | 71 |
+| `Mixtral-8x7B` | 8 | 2 | 1 - 10^-64.0 | 1 - 10^-256 | 2.4 | 16 |
+| DeepSeek-V3 class | 256 | 8 | 1 - 10^-7.1 | 1 - 10^-28 | 21.8 | 145 |
+
+**Read the last column.** Under uniform routing, even a 256-expert model needs
+only **145 tokens** to touch 99% of its experts, and Soup's smallest streaming
+step is 512. Expert-granularity streaming can only save READS if real routing is
+concentrated enough that a 512-token step behaves like roughly five tokens'
+worth of routing diversity. That is the size of the departure from chance the
+feature needs, and stating it before the measurement is what keeps a coverage of
+0.9 from being reported as encouraging.
+
+A larger expert count does move the baseline in the helpful direction — the
+whole column shifts right as E/k grows — which is precisely why §7 records that
+the largest model measured here has 64 experts, and that the plan's own target
+class (744B, 19,456 routed experts across the stack) is far outside it.
 
 ## 2. The decision rule, written before the run
 
