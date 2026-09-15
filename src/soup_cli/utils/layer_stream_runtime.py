@@ -348,11 +348,13 @@ def plan_pinned_arenas(
 
     First-fit into the current arena, else open the next; a tensor never
     straddles two arenas, because it has to be one contiguous view. A tensor
-    larger than ``arena_bytes`` widens every arena to the next power of two
-    above it, so the plan always fits. Each arena is finally trimmed to the
-    power of two above what it holds — the last one is usually part-filled,
-    and a tiny model must not page-lock a whole default arena for a 5 MB store.
-    Pure arithmetic, no torch.
+    larger than ``arena_bytes`` opens an arena sized to the power of two above
+    ITSELF and only that arena is wider — sizing every arena from the store's
+    largest tensor would turn one outlier into a doubled allocation request for
+    every other arena, the shape of request this packer exists to avoid. Each
+    arena is finally trimmed to the power of two above what it holds — the last
+    one is usually part-filled, and a tiny model must not page-lock a whole
+    default arena for a 5 MB store. Pure arithmetic, no torch.
     """
     if arena_bytes <= 0 or arena_bytes & (arena_bytes - 1):
         raise ValueError(f"arena_bytes must be a power of two; got {arena_bytes}")
@@ -365,17 +367,18 @@ def plan_pinned_arenas(
         raise ValueError(f"a negative tensor size was planned: {min(sizes)}")
     if not sizes:
         return ArenaPlan(arena_sizes=(), placements=(), requested_bytes=0)
-    capacity = max(arena_bytes, _next_power_of_two(max(sizes)))
     fills: List[int] = []
+    capacities: List[int] = []
     placements: List[Tuple[int, int]] = []
     for size in sizes:
         if fills:
             start = -(-fills[-1] // align) * align
-            if start + size <= capacity:
+            if start + size <= capacities[-1]:
                 placements.append((len(fills) - 1, start))
                 fills[-1] = start + size
                 continue
         fills.append(size)
+        capacities.append(max(arena_bytes, _next_power_of_two(size)))
         placements.append((len(fills) - 1, 0))
     return ArenaPlan(
         arena_sizes=tuple(max(align, _next_power_of_two(fill)) for fill in fills),

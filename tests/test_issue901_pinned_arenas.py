@@ -106,6 +106,20 @@ class TestPlanPinnedArenas:
         assert plan.placements[0] == (0, 0)
         assert plan.arena_sizes[0] == 1024
 
+    def test_an_oversized_tensor_widens_only_its_own_arena(self):
+        """The first version sized EVERY arena from the largest tensor in the
+        store, so one 300 MiB outlier doubled every other arena's allocation
+        request — the shape of request the driver refuses is what this packer
+        exists to avoid (security review, 2026-09-15). Hand-derived: three
+        100-byte tensors pack 0/128 into arena 0 and the third opens arena 1;
+        600 opens a 1024-capacity arena 2 of its own, whose tail then takes the
+        last three at 640/768/896."""
+        from soup_cli.utils.layer_stream_runtime import plan_pinned_arenas
+
+        plan = plan_pinned_arenas([100, 100, 100, 600, 100, 100, 100], arena_bytes=256, align=64)
+        assert plan.placements == ((0, 0), (0, 128), (1, 0), (2, 0), (2, 640), (2, 768), (2, 896))
+        assert plan.arena_sizes == (256, 128, 1024)
+
     def test_the_last_arena_is_trimmed_to_what_it_holds(self):
         """A tiny model must not page-lock a whole default arena for a 5 MB store."""
         from soup_cli.utils.layer_stream_runtime import plan_pinned_arenas
