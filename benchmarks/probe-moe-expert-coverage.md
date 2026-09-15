@@ -71,7 +71,7 @@ at which uniform routing would reach 50% and 99% coverage.
 | model | E | k | baseline at T=512 | at T=2048 | T for 50% | T for 99% |
 |---|---|---|---|---|---|---|
 | `OLMoE-1B-7B` (measured here) | 64 | 8 | 1 - 10^-29.7 | 1 - 10^-119 | 5.2 | 34 |
-| `granite-3.0-1b-a400m` (measured here) | 32 | 8 | 1 - 10^-64.0 | 1 - 10^-256 | 2.4 | 16 |
+| `granite-3.0-1b-a400m-base` (measured here) | 32 | 8 | 1 - 10^-64.0 | 1 - 10^-256 | 2.4 | 16 |
 | `Qwen3-30B-A3B` (plan; not measured, §7) | 128 | 8 | 1 - 10^-14.4 | 1 - 10^-57 | 10.7 | 71 |
 | `Mixtral-8x7B` | 8 | 2 | 1 - 10^-64.0 | 1 - 10^-256 | 2.4 | 16 |
 | DeepSeek-V3 class | 256 | 8 | 1 - 10^-7.1 | 1 - 10^-28 | 21.8 | 145 |
@@ -118,18 +118,32 @@ scheduling the feature's *design*, not a throughput claim.
 
 ## 3. What is measured, and on what
 
-| model | experts / top-k | why it is here |
-|---|---|---|
-| `allenai/OLMoE-1B-7B-0924` | 64 / 8 | the plan names it; 6.9B total / 1.3B active, the smallest fully-trained MoE with a realistic expert count |
-| `ibm-granite/granite-3.0-1b-a400m` | 32 / 8 | a second (E, k) point at a quarter the experts, cheap, and it fits the card in bf16 — so it is also the control that the NF4 arm is checked against |
+Every identifier below was resolved against the Hub before the run rather than
+written from memory — configs only, a few KB each — and two of the four I first
+wrote down were wrong. The corrections are in the table.
+
+| model | model_type | layers | E / k | hidden | why it is here |
+|---|---|---|---|---|---|
+| `allenai/OLMoE-1B-7B-0924` | `olmoe` | 16 | 64 / 8 | 2048 | the plan names it; 6.9B total / 1.3B active, the smallest fully-trained MoE with a realistic expert count. No shared experts |
+| `ibm-granite/granite-3.0-1b-a400m-base` | `granitemoe` | 24 | 32 / 8 | 1024 | a second (E, k) point at half the experts and a different architecture, 1.3B total so it fits the card in bf16 — which makes it the arm that needs no quantisation at all |
+
+`ibm-granite/granite-3.0-1b-a400m` (without `-base`) **does not exist**; the Hub
+carries `-base` and `-instruct`. `Qwen/Qwen3-30B-A3B` resolves and is
+`qwen3_moe`, 48 layers, 128 experts, top-8 — confirming the numbers §1's table
+uses for it, and it is still skipped for the reason §7 gives.
 
 Three corpora, because routing skew is a property of the text and a single
 domain would overstate it:
 
-- **prose** — `wikitext-2-raw-v1`, train split;
+- **prose** — `hf:Salesforce/wikitext:wikitext-2-raw-v1:train:text`;
 - **code** — this repository's own `src/soup_cli/`, which is real Python and
   needs no download;
-- **math** — `gsm8k`, `main` config, train split, the question field.
+- **math** — `hf:openai/gsm8k:main:train:question`.
+
+**The canonical owner prefixes are load-bearing on `datasets` 5.0.1**: the bare
+ids `wikitext` and `gsm8k`, which most documentation still shows, both fail with
+`HfUriError: Invalid HF URI ... Repository id`. Checked by streaming one row from
+each.
 
 Shapes: `1x512`, `4x512`, `1x2048` — the plan asks for batch x seq of 512 and
 2048, and the two ways of reaching 2048 are measured separately because routing
