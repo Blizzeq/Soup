@@ -224,6 +224,23 @@ copy) to 10.2 s.** Peak VRAM is unchanged to the byte, as it must be — the
 change is host-side. The plan's arithmetic bound on this exact store is
 pinned by `tests/test_issue901_pinned_arenas.py` at <= 1.10x.
 
+**Revised 2026-09-15 13:47, after three reviews changed the packer's rule.**
+The run above used a fixed 256 MiB arena with an exception for oversized
+tensors. Review found that rule packed a *bf16* 14B store at 1.46x (two
+141.6 MB projections cannot share a 256 MiB arena), and a first replacement —
+capacity from the tensor that opens each arena — failed the same store the
+other way (an arena opened by a 52 MB projection stayed at 256 MiB). The
+shipped rule is the power of two above four times the store's largest tensor,
+floored at 256 MiB and capped at 2 GiB. On THIS store the largest tensor is
+the 1.557 GB vocabulary matrix, so every arena is 2 GiB: 5 arenas, 10 GiB, by
+arithmetic — the same figure, reached differently. Re-measured with the final
+code (`issue901_14b_seq384_pinned_arenas_final.json`, baseline free physical
+19.04 GB, 5 Python processes): store 9.932 GB pinned, **10.737 GB
+page-locked**, peak 2.944 GB allocated / 3.244 GB reserved, 0 retries — the
+row above is unchanged to the byte, build 15.4 s (10.2 s before; the box was
+not quiet). The bf16 case is arithmetic only, pinned at <= 1.10x by the test
+file; no bf16 14B store was built here.
+
 **Fix C — the probe calls an out-of-memory `AcceleratorError` an OOM**
 (`b602bb15`). Not exercised by the reproduction after Fix A (nothing raises
 any more); it is the #649 shape the reporter's probe output showed, and it only
