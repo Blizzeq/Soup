@@ -13,11 +13,14 @@ Harness: benchmarks/harness/moe_expert_coverage.py (committed with this file).
 
 # Probe — does a training step touch every expert? (MoE step 0)
 
-**Status: the instrument is built and validated; NO MODEL HAS BEEN MEASURED
-YET.** This file is committed in that state on purpose. `.claude/plan.md` asks
-for a decision rule "written before the run", and the only way to make that
-checkable is to put it in version control before the run happens. §5 onward is
-empty and will be filled by the measurement.
+**Status: measured 2026-09-15. A training step touches essentially every
+expert of every layer — C = 0.967 to 1.000 across two models, three corpora and
+three batch shapes — so expert-granularity streaming saves memory and NOT reads,
+and the rule committed here before the run says to ship it, if at all, as a
+capacity tier with no throughput promise.** The rule in §2 was committed in
+4908d52b, before any model was downloaded; the numbers arrived in §5 afterwards.
+That ordering is checkable in `git log` and is the reason this record is worth
+anything.
 
 ---
 
@@ -242,14 +245,195 @@ caveat with a number.
 
 ## 5. Results
 
-*Not yet measured.*
+Measured 2026-09-15 19:53-20:19 local, on a box with nothing else running: a
+peer session's cold 70B series had finished and its author confirmed the machine
+free. Host baseline stamped either side of every block; the widest excursion over
+the whole run was free physical 18.78-20.56 GB, commit 22.47-24.01 GB of a 53.45
+GB limit, 2 Python processes throughout. Raw JSON under
+`benchmarks/results/probe-rtx5070/moe/`.
+
+Every figure below is a mean over the model's layers, over 16 steps per shape.
+**The chance baseline is 1.000 to three decimals for every row in both tables**,
+which is the point of §1: these coverages are *below* chance, and that is the
+only sense in which they are interesting.
+
+### granite-3.0-1b-a400m-base — 24 layers, 32 experts, top-8, bf16, no quantisation
+
+| corpus | shape | coverage (vs chance) | min layer | max layer | Gini | top-25% share | hot-25 Jaccard step-to-step | caught by prev layer's set | caught by corpus hot-25 |
+|---|---|---|---|---|---|---|---|---|---|
+| prose | 1x512 | 0.997 (chance 1.000) | 0.971 | 1.000 | 0.290 | 0.432 | 0.581 | 0.994 | 0.434 |
+| prose | 4x512 | 0.999 (chance 1.000) | 0.982 | 1.000 | 0.285 | 0.430 | 0.705 | 0.997 | 0.432 |
+| prose | 1x2048 | 0.999 (chance 1.000) | 0.975 | 1.000 | 0.292 | 0.435 | 0.656 | 0.996 | 0.437 |
+| code | 1x512 | 0.997 (chance 1.000) | 0.986 | 1.000 | 0.405 | 0.509 | 0.747 | 0.997 | 0.513 |
+| code | 4x512 | 1.000 (chance 1.000) | 1.000 | 1.000 | 0.409 | 0.511 | 0.827 | 1.000 | 0.515 |
+| code | 1x2048 | 1.000 (chance 1.000) | 0.996 | 1.000 | 0.406 | 0.509 | 0.805 | 1.000 | 0.513 |
+| math | 1x512 | 0.998 (chance 1.000) | 0.969 | 1.000 | 0.312 | 0.446 | 0.738 | 0.995 | 0.449 |
+| math | 4x512 | 0.999 (chance 1.000) | 0.984 | 1.000 | 0.314 | 0.448 | 0.889 | 0.998 | 0.450 |
+| math | 1x2048 | 0.998 (chance 1.000) | 0.979 | 1.000 | 0.312 | 0.446 | 0.858 | 0.996 | 0.449 |
+
+### OLMoE-1B-7B-0924 — 16 layers, 64 experts, top-8, NF4
+
+| corpus | shape | coverage (vs chance) | min layer | max layer | Gini | top-25% share | hot-25 Jaccard step-to-step | caught by prev layer's set | caught by corpus hot-25 |
+|---|---|---|---|---|---|---|---|---|---|
+| prose | 1x512 | 0.980 (chance 1.000) | 0.958 | 0.998 | 0.289 | 0.428 | 0.372 | 0.982 | 0.428 |
+| prose | 4x512 | 1.000 (chance 1.000) | 0.998 | 1.000 | 0.271 | 0.416 | 0.496 | 1.000 | 0.415 |
+| prose | 1x2048 | 0.996 (chance 1.000) | 0.990 | 1.000 | 0.271 | 0.413 | 0.397 | 0.997 | 0.413 |
+| code | 1x512 | 0.967 (chance 1.000) | 0.909 | 1.000 | 0.552 | 0.663 | 0.686 | 0.963 | 0.675 |
+| code | 4x512 | 0.990 (chance 1.000) | 0.961 | 1.000 | 0.558 | 0.668 | 0.806 | 0.992 | 0.681 |
+| code | 1x2048 | 0.985 (chance 1.000) | 0.942 | 1.000 | 0.535 | 0.642 | 0.718 | 0.987 | 0.654 |
+| math | 1x512 | 0.984 (chance 1.000) | 0.955 | 1.000 | 0.412 | 0.520 | 0.676 | 0.981 | 0.524 |
+| math | 4x512 | 0.997 (chance 1.000) | 0.988 | 1.000 | 0.414 | 0.520 | 0.803 | 0.997 | 0.525 |
+| math | 1x2048 | 0.995 (chance 1.000) | 0.985 | 1.000 | 0.422 | 0.526 | 0.789 | 0.994 | 0.532 |
+
+Per layer, corpus `code`, shape `1x512` (chance baseline 1.000000):
+
+| layer | coverage | experts touched | Gini | top-10% | top-25% | caught by prev layer | caught by corpus hot-25 |
+|---|---|---|---|---|---|---|---|
+| 0 | 0.996 | 63.8 / 64 | 0.354 | 0.277 | 0.487 | - | - |
+| 1 | 1.000 | 64.0 / 64 | 0.360 | 0.313 | 0.504 | 0.997 | 0.504 |
+| 2 | 0.999 | 63.9 / 64 | 0.407 | 0.343 | 0.546 | 1.000 | 0.546 |
+| 3 | 0.993 | 63.6 / 64 | 0.495 | 0.345 | 0.611 | 0.999 | 0.611 |
+| 4 | 0.987 | 63.2 / 64 | 0.590 | 0.493 | 0.710 | 0.985 | 0.710 |
+| 5 | 0.979 | 62.6 / 64 | 0.611 | 0.476 | 0.721 | 0.964 | 0.721 |
+| 6 | 0.978 | 62.6 / 64 | 0.573 | 0.422 | 0.672 | 0.982 | 0.672 |
+| 7 | 0.966 | 61.8 / 64 | 0.597 | 0.465 | 0.693 | 0.968 | 0.693 |
+| 8 | 0.971 | 62.1 / 64 | 0.577 | 0.429 | 0.679 | 0.928 | 0.679 |
+| 9 | 0.980 | 62.8 / 64 | 0.595 | 0.453 | 0.698 | 0.946 | 0.698 |
+| 10 | 0.968 | 61.9 / 64 | 0.532 | 0.391 | 0.635 | 0.957 | 0.635 |
+| 11 | 0.957 | 61.2 / 64 | 0.627 | 0.480 | 0.737 | 0.980 | 0.737 |
+| 12 | 0.926 | 59.2 / 64 | 0.617 | 0.477 | 0.722 | 0.957 | 0.722 |
+| 13 | 0.953 | 61.0 / 64 | 0.639 | 0.514 | 0.739 | 0.836 | 0.739 |
+| 14 | 0.912 | 58.4 / 64 | 0.617 | 0.444 | 0.718 | 0.979 | 0.718 |
+| 15 | 0.909 | 58.2 / 64 | 0.635 | 0.477 | 0.734 | 0.963 | 0.734 |
+
+Verdict inputs: **C = 0.967 to 1.000** over 9 corpus/shape combinations; **S = 0.413 to 0.668**.
+
+### Finding 1 — a training step touches essentially every expert, at every shape, on both models
+
+**C = 0.967 to 1.000** over 18 corpus/shape combinations across the two models.
+The lowest single layer anywhere is **0.909** — OLMoE, code, layer 15, at the
+smallest shape (1 x 512), which is still 58.2 of 64 experts. The one place a
+layer is saturated across the board is **granite on code at 2048 tokens**,
+where all 24 layers touch all 32 experts; prose and math on the same model and
+shape still leave a layer at 0.982 and 0.984. So even "every expert, every
+layer" is corpus-dependent.
+
+More tokens means more coverage, monotonically and as chance predicts: OLMoE on
+code goes 0.967 at 512 tokens to 0.990 at 2048. There is no shape in the
+measured range where a step reads a usefully smaller set.
+
+### Finding 2 — concentration is real, corpus-dependent, and grows with depth
+
+Coverage says nothing about how the traffic is distributed, and the two answers
+are different. Gini over the same runs is **0.271 (OLMoE, prose) to 0.558
+(OLMoE, code)**, and the busiest quartile of experts takes **41% to 67%** of all
+assignments depending on the corpus.
+
+Code concentrates hardest on both models (granite 0.41 Gini vs 0.29 on prose;
+OLMoE 0.55 vs 0.27), which is why three domains were measured rather than one:
+a single-domain corpus would have reported this as a property of the model.
+
+It also **grows with depth**, and the per-layer tables are where that shows.
+OLMoE on code, 1 x 512: layer 0 has coverage 0.996 at Gini 0.354, layer 15 has
+coverage 0.909 at Gini 0.635. Prose and math on the same model move much less
+(L0 0.998/0.263 to L15 0.974/0.353, and 0.999/0.303 to 0.975/0.436). A mean over
+layers hides this, which is why both tables carry a per-layer breakdown.
+
+### Finding 3 — the prefetch numbers are trivial here, exactly as pre-warned
+
+"Traffic caught by the previous layer's used set" comes out at **0.963 to
+1.000** everywhere. That is not a result. §2 said so before the measurement: at
+coverage near 1.0 the previous layer's used set is nearly every expert, so the
+hit rate is near 1.0 by construction and means only that prefetching everything
+works — which is what the layer tier already does.
+
+The other predictor is meaningful and says something different: prefetching a
+layer's **corpus-wide busiest quartile** catches **0.413 to 0.681** of its
+traffic, matching that layer's top-25% share to within 0.005 on granite and 0.013 on
+OLMoE. That
+agreement is itself a result: per-step traffic is close to the corpus average,
+i.e. **steps are homogeneous** and a heat file computed once would not be
+chasing a moving target.
+
+Whether the hot SET is stable is a separate question and the answer splits by
+corpus. Step-to-step Jaccard of the busiest quartile is **0.372-0.496 on OLMoE
+prose** — below the rule's 0.7 — and **0.676-0.806 on OLMoE code and math**. On
+granite it is 0.581-0.889. So the hot set is stable where the traffic is
+concentrated and unstable where it is not, which is coherent but means a
+persisted heat file is a code-and-math device, not a general one.
+
+### Finding 4 — NF4 did not move the answer
+
+The control re-ran OLMoE in **bf16 on the CPU** over math at 4 x 512, which is
+the one arm that needs no quantisation at all. Against the NF4 arm's same corpus
+and shape:
+
+| | NF4 / cuda | bf16 / cpu | delta |
+|---|---|---|---|
+| coverage (mean over layers) | 0.9974 | 0.9966 | -0.0008 |
+| coverage (worst layer) | 0.9883 | 0.9883 | 0.0000 |
+| Gini | 0.4136 | 0.4173 | +0.0037 |
+| busiest quartile's share | 0.5200 | 0.5235 | +0.0034 |
+
+The largest per-layer coverage difference anywhere is **0.0068**, at layer 7.
+
+**The check is stronger than a single-variable comparison would be, because the
+two arms differ in four ways at once**: precision (NF4 against bf16), device
+(cuda against cpu), step count (16 against 4) and corpus slice (4000 rows
+against 1500, and the record's own sha256 of the two differs). So the ~0.004
+agreement is an upper bound on **all four together**, which is the useful
+direction: whatever NF4 does to routing here is smaller than that, and smaller
+by two orders of magnitude than the corpus-to-corpus spread the same model shows
+(Gini 0.271 on prose against 0.558 on code).
+
+The router itself was never quantised — in transformers 5.17 a top-k router
+holds its weight as a bare `nn.Parameter` used through `F.linear`, so
+`replace_with_bnb_linear` does not see it — and this measures the remaining
+question, which is what NF4 does to the hidden state the router reads.
+
+### What follows arithmetically, and is NOT a measurement
+
+With union coverage at ~1.0, **the read volume of an expert-streamed step equals
+the read volume of a layer-streamed one**: every expert is demanded at least
+once, so every expert is fetched, and how often each is used afterwards changes
+nothing about the bytes. That is the plan's own trap paragraph, confirmed.
+
+It also fixes what a hot/cold split would be worth, and the answer is not the
+skew figure. If a fraction `f` of a layer's experts are kept resident, the
+streamed bytes fall to `coverage - f`, i.e. **by `f`**. Keeping the busiest
+quartile of OLMoE's experts resident saves **25% of the read volume**, not the
+67% of *traffic* those experts carry. The traffic share decides whether a hot
+set can be picked at all and whether it is stable; it does not size the saving.
 
 ## 6. Verdict
 
-*Not yet measured. The rule in §2 decides it, and §2 is committed before §5
-exists.*
+**Against the rule committed in §2 before any of this was measured:**
 
-## 7. What this will NOT measure
+| rule input | measured | branch |
+|---|---|---|
+| `C` | **0.967-1.000** (worst single layer 0.909) | **`C >= 0.85` — memory only** |
+| `S` | 0.413-0.681; `>= 0.60` only on OLMoE + code | hybrid tier indicated **for code-like data on 64 experts**, not generally |
+| hot-set Jaccard | 0.372-0.889; `< 0.7` on OLMoE prose | a persisted heat file is not a general device |
+| one-layer-ahead | 0.963-1.000, uninterpretable at this coverage | no throughput claim is licensed |
+
+**So: expert-granularity streaming is a capacity tier for MoE, and it must be
+shipped with an explicit promise of no throughput gain.** It would let a model
+whose single NF4 layer does not fit two VRAM buffers train at all, which is a
+real and useful thing — the same kind of thing v0.72.3's 70B demonstration was,
+and it deserves the same honesty about what it does not do.
+
+**The plan's step 1 should not be scheduled on this evidence.** It is sized at
+"the whole async-NVMe project again"; what the measurement licenses is a
+capacity tier, and the read-bound problem it was hoped to solve is untouched.
+
+**The cheaper deliverable the rule points at is narrower than the rule assumed.**
+A hybrid RAM+disk tier is defensible only where the traffic concentrates AND the
+hot set is stable, which here is code and math on the 64-expert model, not prose
+and not the 32-expert one. And by the arithmetic above its saving is the
+resident fraction, so it is a memory-for-bandwidth trade with a known exchange
+rate rather than a throughput feature.
+
+## 7. What this did NOT measure
 
 - **`Qwen3-30B-A3B`, which the plan names.** 60 GB in bf16 against 31.7 GB of
   RAM and 8 GB of VRAM; NF4 is ~15 GB, which fits neither the card nor a
@@ -257,15 +441,69 @@ exists.*
   the two models in §3 are what this box can honestly carry. The consequence is
   stated rather than hidden: **the largest expert count measured here is 64**,
   and a 128- or 256-expert model at the same token budget would have a LOWER
-  chance baseline and could behave differently.
+  chance baseline and could behave differently. Note which way that cuts: at
+  128 experts chance still predicts 99% coverage within 71 tokens, so a bigger
+  model makes the verdict LESS likely to change, not more - but it is not
+  measured, and the two models here agreed rather than diverged, which is one
+  data point about the trend and not two.
 - **A learned one-layer-ahead predictor.** Step 0 measures the two FREE
   predictors instead: the previous layer's own used set, and a corpus-wide heat
   quartile. They bound from below what a learned one could be worth, without
   training anything.
-- **Any timing.** The forward runs with a hook on every router and, in the CPU
-  control, at no throughput anybody should quote.
+- **Any timing.** The forward ran with a hook on every router and, in the CPU
+  control, at no throughput anybody should quote. The wall-clock figures in §8
+  are for planning a re-run, not performance evidence.
 - **Backward routing.** Only the forward's router decisions are observed; the
   recompute re-runs the same routers on the same hidden states, so the expert
   SET is the same, but that is an argument rather than a measurement.
 - **Training-time drift.** All routing here is from a trained checkpoint at rest.
   Whether a fine-tune moves the hot set is a different question.
+
+## 8. Reproducing
+
+Both blocks, as run, from the repository root. No `soup_cli` import and no
+`PYTHONPATH`; the harness runs against a stock transformers install.
+
+```bash
+python benchmarks/harness/moe_expert_coverage.py \
+  --model ibm-granite/granite-3.0-1b-a400m-base \
+  --data hf:Salesforce/wikitext:wikitext-2-raw-v1:train:text --data-label prose \
+  --data src/soup_cli --data-label code \
+  --data hf:openai/gsm8k:main:train:question --data-label math \
+  --shape 1x512 --shape 4x512 --shape 1x2048 --batches 16 --limit-rows 4000 \
+  --device cuda --dtype bfloat16 \
+  --out benchmarks/results/probe-rtx5070/moe/granite_bf16_cuda.json
+
+python benchmarks/harness/moe_expert_coverage.py \
+  --model allenai/OLMoE-1B-7B-0924 \
+  ... same --data / --shape / --batches ... \
+  --device cuda --dtype bfloat16 --load-4bit \
+  --out benchmarks/results/probe-rtx5070/moe/olmoe_nf4_cuda.json
+
+python benchmarks/harness/moe_expert_coverage.py \
+  --model allenai/OLMoE-1B-7B-0924 \
+  --data hf:openai/gsm8k:main:train:question --data-label math \
+  --shape 4x512 --batches 4 --limit-rows 1500 --device cpu --dtype bfloat16 \
+  --out benchmarks/results/probe-rtx5070/moe/olmoe_bf16_cpu_control.json
+```
+
+Tables from the JSON, without re-running anything:
+
+```bash
+python benchmarks/harness/moe_coverage_report.py \
+  benchmarks/results/probe-rtx5070/moe/*.json --layer-corpus code --layer-shape 1x512
+```
+
+Timings on this box, for planning rather than as a claim: granite 2m26s
+including its download, OLMoE NF4 16m28s (the 13.8 GB fetch dominates), the CPU
+control 6m42s. Free physical RAM never fell below 18.78 GB and the Python
+process count stayed at 2.
+
+**One thing the runner used is deliberately NOT committed.** A shell wrapper
+stamped the host baseline and refused to start when a neighbour's probe was
+alive; its process-counting query was malformed and returned 0 whether or not
+anything was running, i.e. it was a guard that could not fire. The box was
+verified free independently, so no number here is affected, but a broken guard
+is worse than none and shipping it would have been worse still. The commands
+above are what ran; the box-state discipline is in the prose, where it cannot
+silently fail.
