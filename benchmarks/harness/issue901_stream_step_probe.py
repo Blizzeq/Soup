@@ -190,7 +190,7 @@ def main() -> int:
         out.loss.backward()
         mark("after backward")
         del out
-    except Exception as exc:  # noqa: BLE001 - catching the OOM is the point
+    except Exception as exc:  # catching the OOM is the point
         outcome = type(exc).__name__
         error = str(exc).splitlines()[0][:300]
         print(f"STEP RAISED {outcome}: {error}")

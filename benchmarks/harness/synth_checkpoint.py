@@ -101,7 +101,7 @@ def _transformers_version() -> str:
         import transformers
 
         return str(transformers.__version__)
-    except Exception:  # noqa: BLE001 - the generator needs only torch
+    except Exception:  # the generator needs only torch
         return "4.45.0"
 
 

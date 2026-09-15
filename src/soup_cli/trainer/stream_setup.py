@@ -39,6 +39,31 @@ console = Console()
 _PROBE_DEFERRAL_CEILING = 4.0
 
 
+def _stream_source_line(stats: dict) -> str:
+    """The source half of the ``Layer streaming ready:`` line, from ``runtime.stats()``.
+
+    On the RAM tier the store's bytes are stated, and — since #901 — the bytes
+    the box actually page-locked for it when the source knows them: pinned host
+    memory is handed out in power-of-two blocks, so the two differ. A pageable
+    store, and a source that does not account for it (``pinned_bytes`` None),
+    print no second figure. The disk tier names its reader depth and staging
+    instead: not "nothing held resident" (#971).
+    """
+    from soup_cli.utils.layer_stream import TIER_RAM
+
+    pinned = "pinned" if stats["pinned"] else "pageable"
+    if stats["tier"] == TIER_RAM:
+        line = f"{stats['store_bytes'] / 1e9:.2f} GB {pinned} RAM store"
+        if stats["pinned"] and stats.get("pinned_bytes"):
+            line += f" ({stats['pinned_bytes'] / 1e9:.2f} GB page-locked)"
+        return line
+    return (
+        f"streamed from DISK ({stats['disk_bytes'] / 1e9:.2f} GB on an NVMe volume) "
+        f"by an async reader, read_ahead={stats['read_ahead']}, "
+        f"{stats['store_bytes'] / 1e6:.0f} MB {pinned} host staging"
+    )
+
+
 def _validate_qwen4_streaming_mode(*, arch: str, task: str, quant: str) -> None:
     """Keep unvalidated Qwen4 training modes outside the streamed path."""
     if arch != "qwen4_exp":
@@ -482,7 +507,6 @@ class StreamingSetupMixin:
         from soup_cli.utils.layer_stream import (
             RAM_TIER_HEADROOM,
             TIER_DISK,
-            TIER_RAM,
             build_stream_plan,
             dtype_bytes,
             estimate_stream_store_bytes,
@@ -928,26 +952,7 @@ class StreamingSetupMixin:
         if probe_plan is not None:
             self._run_stream_vram_probe(model, probe_plan)
         stats = runtime.stats()
-        if stats["tier"] == TIER_RAM:
-            source_line = (
-                f"{stats['store_bytes'] / 1e9:.2f} GB "
-                f"{'pinned' if stats['pinned'] else 'pageable'} RAM store"
-            )
-            # #901: page-locked memory is handed out in power-of-two blocks, so
-            # what the box actually pins for the store is not its byte count.
-            # Say the real figure beside it whenever the source knows it.
-            if stats["pinned"] and stats.get("pinned_bytes"):
-                source_line += f" ({stats['pinned_bytes'] / 1e9:.2f} GB page-locked)"
-        else:
-            # Not "nothing held resident": the async reader stages `read_ahead`
-            # layers in host memory, so say how deep and how much (#971).
-            source_line = (
-                f"streamed from DISK ({stats['disk_bytes'] / 1e9:.2f} GB on an "
-                f"NVMe volume) by an async reader, "
-                f"read_ahead={stats['read_ahead']}, "
-                f"{stats['store_bytes'] / 1e6:.0f} MB "
-                f"{'pinned' if stats['pinned'] else 'pageable'} host staging"
-            )
+        source_line = _stream_source_line(stats)
         large_runtime_buffer = stats.get("large_buffer_bytes", 0)
         decoder_buffers = stats["buffer_bytes"] - large_runtime_buffer
         buffer_line = (

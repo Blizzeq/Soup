@@ -24,6 +24,7 @@ import time
 from dataclasses import dataclass
 from typing import (
     Any,
+    Callable,
     Dict,
     FrozenSet,
     Iterator,
@@ -313,6 +314,10 @@ def quant_sidecar_keys(key: str, spec: Any) -> Tuple[str, ...]:
 #: page-lock the base" meant on a 32 GB machine. The pinned store is therefore
 #: packed into arenas whose sizes ARE powers of two, every tensor a view.
 PINNED_ARENA_BYTES = 2**28
+#: The largest arena the packer will open on its own. A tensor bigger than this
+#: still gets an arena that fits it. Measured on the dev box: an 8 GB pinned
+#: request was granted, 9 GB refused (it rounds to 16 GiB), 2 GB chunks fine.
+PINNED_ARENA_MAX_BYTES = 2**31
 #: Every view starts on this boundary: enough for any dtype and for the DMA
 #: engine, and a rounding error of at most 255 bytes per tensor.
 PINNED_ARENA_ALIGN = 256
@@ -347,14 +352,25 @@ def plan_pinned_arenas(
     """Pack ``sizes`` (bytes, allocation order) into power-of-two arenas.
 
     First-fit into the current arena, else open the next; a tensor never
-    straddles two arenas, because it has to be one contiguous view. A tensor
-    larger than ``arena_bytes`` opens an arena sized to the power of two above
-    ITSELF and only that arena is wider — sizing every arena from the store's
-    largest tensor would turn one outlier into a doubled allocation request for
-    every other arena, the shape of request this packer exists to avoid. Each
-    arena is finally trimmed to the power of two above what it holds — the last
-    one is usually part-filled, and a tiny model must not page-lock a whole
-    default arena for a 5 MB store. Pure arithmetic, no torch.
+    straddles two arenas, because it has to be one contiguous view.
+
+    The arena capacity is the power of two above FOUR times the store's largest
+    tensor, floored at ``arena_bytes`` and capped at
+    :data:`PINNED_ARENA_MAX_BYTES`; a tensor beyond the cap still gets an arena
+    that fits it. Two review findings and one failed alternative shaped that.
+    A fixed capacity packs badly the moment tensors approach it — at 256 MiB a
+    bf16 Qwen2.5-14B store, whose 141.6 MB projections cannot share an arena
+    two at a time, cost 1.46x. Sizing each arena from the tensor that opened it
+    was tried and rejected: in that same store an arena opened by a 52 MB
+    projection stayed at 256 MiB and packed the 141.6 MB tensors that followed
+    one per arena again. Four times the largest tensor bounds every arena's
+    tail waste to a quarter and measures ~5% on that store. The cost of a
+    global capacity is that one outlier raises every arena's REQUEST size —
+    which the cap bounds at 2 GiB, a request this box granted where a 9 GB one
+    (rounded to 16 GiB) was refused; the total stays near the store's bytes
+    either way. Each arena is finally trimmed to the power of two above what
+    it holds — the last one is usually part-filled, and a tiny model must not
+    page-lock a whole default arena for a 5 MB store. Pure arithmetic, no torch.
     """
     if arena_bytes <= 0 or arena_bytes & (arena_bytes - 1):
         raise ValueError(f"arena_bytes must be a power of two; got {arena_bytes}")
@@ -367,6 +383,8 @@ def plan_pinned_arenas(
         raise ValueError(f"a negative tensor size was planned: {min(sizes)}")
     if not sizes:
         return ArenaPlan(arena_sizes=(), placements=(), requested_bytes=0)
+    ceiling = max(arena_bytes, PINNED_ARENA_MAX_BYTES)
+    capacity = min(max(arena_bytes, _next_power_of_two(4 * max(sizes))), ceiling)
     fills: List[int] = []
     capacities: List[int] = []
     placements: List[Tuple[int, int]] = []
@@ -378,7 +396,8 @@ def plan_pinned_arenas(
                 fills[-1] = start + size
                 continue
         fills.append(size)
-        capacities.append(max(arena_bytes, _next_power_of_two(size)))
+        # Only a tensor beyond the ceiling opens an arena wider than the rest.
+        capacities.append(max(capacity, _next_power_of_two(size)))
         placements.append((len(fills) - 1, 0))
     return ArenaPlan(
         arena_sizes=tuple(max(align, _next_power_of_two(fill)) for fill in fills),
@@ -413,6 +432,7 @@ class RamSource:
         *,
         pin: bool = True,
         shard_paths: Optional[Sequence[str]] = None,
+        arena_bytes: int = PINNED_ARENA_BYTES,
     ):
         import torch
         from safetensors import safe_open
@@ -425,15 +445,18 @@ class RamSource:
         self.arena_sizes: Tuple[int, ...] = ()
         self.pinned_bytes = 0
         plan: Optional[ArenaPlan] = None
+        planned_sizes: List[int] = []
         arenas: List[Any] = []
         if self.pinned:
-            plan = plan_pinned_arenas(
-                [
-                    math.prod(shape) * _dtype_size(dtype)
-                    for idx in range(n_layers)
-                    for _name, (shape, dtype) in layer_specs[idx].items()
-                ]
-            )
+            # ONE walk defines the order the plan is indexed by; the fill loop
+            # below re-derives each length and refuses to proceed if it ever
+            # disagrees, so the two cannot drift apart silently.
+            planned_sizes = [
+                math.prod(shape) * _dtype_size(dtype)
+                for idx in range(n_layers)
+                for _name, (shape, dtype) in layer_specs[idx].items()
+            ]
+            plan = plan_pinned_arenas(planned_sizes, arena_bytes=arena_bytes)
             for size in plan.arena_sizes:
                 # This is the host store; never inherit a process-wide MPS/CUDA default.
                 arena = torch.empty(size, dtype=torch.uint8, device="cpu", pin_memory=True)
@@ -450,8 +473,15 @@ class RamSource:
                     torch_dtype = _torch_dtype(dtype)
                     if plan is not None:
                         arena_index, offset = plan.placements[position]
-                        position += 1
                         length = math.prod(shape) * _dtype_size(dtype)
+                        if planned_sizes[position] != length:
+                            raise RuntimeError(
+                                f"layer streaming's pinned-arena plan is out of step with "
+                                f"the store at layer {idx}, tensor {name!r} (planned "
+                                f"{planned_sizes[position]} bytes, filling {length}); this "
+                                f"is a bug, please report it"
+                            )
+                        position += 1
                         dst = (
                             arenas[arena_index][offset : offset + length]
                             .view(torch_dtype)
@@ -1561,28 +1591,17 @@ def measure_step_peak_bytes(
         elapsed = time.perf_counter() - started
         peak = int(torch.cuda.max_memory_allocated(device))
         reserved = int(torch.cuda.max_memory_reserved(device))
-    except torch.cuda.OutOfMemoryError:  # pragma: no cover - needs a real OOM
-        # A result, not a failure: the shape provably does not fit. Linux raises
-        # here; Windows/WDDM spills to host memory instead and reaches the
-        # success path with a peak above free VRAM, which the caller refuses just
-        # the same.
-        return StepPeak(
-            peak_bytes=0,
-            reserved_bytes=0,
-            seconds=time.perf_counter() - started,
-            rows=rows,
-            seq_len=seq_len,
-            oom=True,
-        )
     except Exception as exc:  # pragma: no cover - a real CUDA op raised
         if _is_out_of_memory(exc):
-            # #649's shape, seen in #901: under WDDM the allocator has often
-            # already spilled, so the out-of-memory surfaces later, at a
-            # synchronise, as `AcceleratorError("CUDA error: out of memory")`
-            # rather than as the allocator's own exception. Same verdict — the
-            # shape does not fit — and the verdict is what tells the operator
-            # to lower batch or max_length, where "instrument failure" tells
-            # them nothing they can act on.
+            # A result, not a failure: the shape provably does not fit. That is
+            # the allocator's own `torch.OutOfMemoryError` on Linux, and — #649's
+            # shape, seen again in #901 — under WDDM, where the allocator has
+            # often already spilled, an `AcceleratorError("CUDA error: out of
+            # memory")` surfacing later at a synchronise. One spelling for both:
+            # the verdict is what tells the operator to lower batch or
+            # max_length, where "instrument failure" tells them nothing they can
+            # act on. (A WDDM run that spills WITHOUT raising reaches the success
+            # path with a peak above free VRAM, which the caller refuses too.)
             return StepPeak(
                 peak_bytes=0,
                 reserved_bytes=0,
@@ -2342,12 +2361,19 @@ def install_streaming(
 
 
 def _is_out_of_memory(exc: BaseException) -> bool:
-    """``torch.OutOfMemoryError`` and ``AcceleratorError`` are both RuntimeErrors;
-    the text is what they share (mirrors ``batch_probe._is_cuda_oom``)."""
-    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+    """THE one spelling of "the device ran out of memory", shared with the batch
+    probe: the allocator's ``torch.OutOfMemoryError``, or a ``RuntimeError``
+    (``AcceleratorError`` is one) whose text says so."""
+    import torch
+
+    from soup_cli.utils.batch_probe import _is_cuda_oom
+
+    return _is_cuda_oom(exc, torch)
 
 
-def drain_stale_cuda_error(device: str = "cuda", *, launch: Any = None) -> bool:
+def drain_stale_cuda_error(
+    device: str = "cuda", *, launch: Optional[Callable[[], None]] = None
+) -> bool:
     """#901 — consume the stale error a failed page-lock leaves on the CUDA runtime.
 
     ``cuMemHostAlloc`` refusing a ``pin_memory=True`` allocation raises
@@ -2419,7 +2445,13 @@ def release_cached_pinned_memory() -> int:
 
 
 def recover_from_failed_page_lock(*, device: str = "cuda", console: Any = None) -> bool:
-    """What a pageable fallback owes the run before it builds anything (#901)."""
+    """What a pageable fallback owes the run before it builds anything (#901).
+
+    Returns True when a stale CUDA error was drained — the half that decides
+    whether the run's next kernel launch lives. The cache release is reported
+    in the message (bytes, when any were returned) but not in the return value:
+    a full cache costs RAM, an undrained error costs the run.
+    """
     drained = drain_stale_cuda_error(device)
     released = release_cached_pinned_memory()
     if not drained and not released:
@@ -2435,6 +2467,18 @@ def recover_from_failed_page_lock(*, device: str = "cuda", console: Any = None) 
     else:
         logger.info(message)
     return drained
+
+
+def _recover_before_refusing(console: Any) -> None:
+    """The refusal branches of ``_build_source`` raise instead of falling back,
+    but the stale error a failed page-lock leaves is per-thread and outlives
+    the exception: a caller that catches the refusal (a test, a wrapper that
+    retries with other settings) would inherit it. Best effort, because the
+    refusal is the message that matters and nothing here may replace it."""
+    try:
+        recover_from_failed_page_lock(console=console)
+    except Exception as exc:  # noqa: BLE001 - never let cleanup mask the refusal
+        logger.warning("page-lock recovery failed before the refusal: %r", exc)
 
 
 def _build_source(
@@ -2490,6 +2534,7 @@ def _build_source(
                 # constructor that raised here owns no thread and no buffers —
                 # there is nothing to close before retrying.
                 if require_pin:
+                    _recover_before_refusing(console)
                     raise RuntimeError(
                         "training.stream_pin=true but this box could not "
                         "page-lock the disk tier's host staging "
@@ -2539,6 +2584,7 @@ def _build_source(
     except (RuntimeError, MemoryError) as exc:
         store_gb = _spec_bytes(spec, n_layers=n_layers) / 1e9
         if require_pin:
+            _recover_before_refusing(console)
             raise RuntimeError(
                 "training.stream_pin=true but this box could not page-lock the "
                 f"{store_gb:.2f} GB RAM store ({type(exc).__name__}). Refusing "

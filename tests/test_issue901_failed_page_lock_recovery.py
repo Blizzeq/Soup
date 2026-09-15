@@ -148,6 +148,31 @@ class TestRecoveryHelpersOffTheHappyPath:
         monkeypatch.setattr(torch.cuda, "host_memory_stats", lambda: {}, raising=False)
         assert release_cached_pinned_memory() == 0
 
+    def test_what_the_recovery_did_is_said_once_on_the_console(self, monkeypatch):
+        """Both halves reported in one line, and the return value is the drain
+        (the half that decides whether the next kernel launch lives)."""
+        import soup_cli.utils.layer_stream_runtime as rt
+
+        monkeypatch.setattr(rt, "drain_stale_cuda_error", lambda device: True)
+        monkeypatch.setattr(rt, "release_cached_pinned_memory", lambda: 2_000_000_000)
+        console = _Console()
+        assert rt.recover_from_failed_page_lock(device="cuda", console=console) is True
+        assert len(console.printed) == 1
+        assert "cleared the stale CUDA out-of-memory error" in console.printed[0]
+        assert "released 2.00 GB of page-locked memory" in console.printed[0]
+
+    def test_without_a_console_the_recovery_reports_through_the_logger(self, monkeypatch, caplog):
+        import logging
+
+        import soup_cli.utils.layer_stream_runtime as rt
+
+        monkeypatch.setattr(rt, "drain_stale_cuda_error", lambda device: False)
+        monkeypatch.setattr(rt, "release_cached_pinned_memory", lambda: 512 * 2**20)
+        with caplog.at_level(logging.INFO, logger=rt.logger.name):
+            assert rt.recover_from_failed_page_lock(device="cuda", console=None) is False
+        assert "released 0.54 GB of page-locked memory" in caplog.text
+        assert "cleared" not in caplog.text
+
 
 class TestTheFallbackRecoversBeforeBuildingThePageableStore:
     """``_build_source``: the recovery runs BETWEEN the failed pinned constructor
@@ -175,14 +200,14 @@ class TestTheFallbackRecoversBeforeBuildingThePageableStore:
                 super().__init__(shard_dir, n_layers, spec, pin=False)
 
         monkeypatch.setattr(rt, "RamSource", _FailsWhenPinned)
+        console = _Console()
         monkeypatch.setattr(
             rt,
             "recover_from_failed_page_lock",
-            lambda **kwargs: events.append("recover") or True,
+            lambda **kwargs: events.append(("recover", kwargs.get("console") is console)) or True,
         )
-        console = _Console()
         source, pinned = rt._build_source(shards, index.n_layers, spec, True, console)
-        assert events == [("ramsource", True), "recover", ("ramsource", False)]
+        assert events == [("ramsource", True), ("recover", True), ("ramsource", False)]
         assert pinned is False
         assert source.nbytes > 0
 
@@ -203,26 +228,28 @@ class TestTheFallbackRecoversBeforeBuildingThePageableStore:
                 super().__init__(*args, pin=False, **kwargs)
 
         monkeypatch.setattr(ads, "AsyncDiskSource", _FailsWhenPinned)
+        console = _Console()
         monkeypatch.setattr(
             rt,
             "recover_from_failed_page_lock",
-            lambda **kwargs: events.append("recover") or True,
+            lambda **kwargs: events.append(("recover", kwargs.get("console") is console)) or True,
         )
-        console = _Console()
         source, pinned = rt._build_source(
             shard_dir, N_LAYERS, _spec(shard_dir), True, console, "disk", read_ahead=2
         )
         try:
-            assert events == [("asyncsource", True), "recover", ("asyncsource", False)]
+            assert events == [("asyncsource", True), ("recover", True), ("asyncsource", False)]
             assert pinned is False
         finally:
             source.close()
 
-    def test_a_refused_pin_under_stream_pin_true_does_not_build_anything_to_recover_for(
+    def test_a_refused_pin_under_stream_pin_true_still_drains_before_raising(
         self, tmp_path, monkeypatch
     ):
-        """``require_pin`` raises instead of falling back; the process is refusing,
-        so no pageable store is built and no recovery is attempted for one."""
+        """``require_pin`` raises instead of falling back — no pageable store is
+        built — but the stale error outlives the exception, so the recovery runs
+        before the refusal (python review, 2026-09-15): a caller that catches
+        the refusal must not inherit a poisoned context."""
         import soup_cli.utils.layer_stream_runtime as rt
         from soup_cli.utils.layer_shard import shard_checkpoint
         from tests.test_v07200 import _tiny_llama_dir
@@ -246,7 +273,7 @@ class TestTheFallbackRecoversBeforeBuildingThePageableStore:
         )
         with pytest.raises(RuntimeError, match="stream_pin=true"):
             rt._build_source(shards, index.n_layers, spec, True, _Console(), require_pin=True)
-        assert events == [("ramsource", True)]
+        assert events == [("ramsource", True), "recover"]
 
 
 @requires_cuda
@@ -343,6 +370,9 @@ class TestOnRealHardware:
 
         from soup_cli.utils.layer_stream_runtime import recover_from_failed_page_lock
 
+        if not hasattr(torch.cuda, "host_memory_stats"):
+            pytest.skip("this torch has no host_memory_stats to read the cache from")
+
         def cached_bytes() -> int:
             stats = torch.cuda.host_memory_stats()
             return int(stats["allocated_bytes.current"]) - int(stats["active_bytes.current"])
@@ -367,10 +397,20 @@ class TestTheProbeCallsAnOutOfMemoryAcceleratorErrorAnOom:
     exactly the message the reporter got."""
 
     @staticmethod
-    def _model_raising(exc):
+    def _model_raising(message: str):
+        """A model whose forward raises ``torch.AcceleratorError(message)`` —
+        the class torch >= 2.8 raises for a CUDA-runtime error; older torch
+        (the declared floor is 2.6) spells it ``RuntimeError`` and has nothing
+        to classify here, so the test skips rather than errors."""
+        import torch
+
+        accelerator_error = getattr(torch, "AcceleratorError", None)
+        if accelerator_error is None:
+            pytest.skip("this torch has no AcceleratorError (added in 2.8)")
+
         class _Model:
             def __call__(self, **kwargs):
-                raise exc
+                raise accelerator_error(message)
 
             @staticmethod
             def parameters():
@@ -379,12 +419,10 @@ class TestTheProbeCallsAnOutOfMemoryAcceleratorErrorAnOom:
         return _Model()
 
     def test_an_out_of_memory_accelerator_error_is_an_oom_verdict_not_a_failure(self):
-        import torch
-
         from soup_cli.utils.layer_stream_runtime import measure_step_peak_bytes
 
         peak = measure_step_peak_bytes(
-            self._model_raising(torch.AcceleratorError("CUDA error: out of memory")),
+            self._model_raising("CUDA error: out of memory"),
             rows=1,
             seq_len=8,
             vocab_size=32,
@@ -394,14 +432,10 @@ class TestTheProbeCallsAnOutOfMemoryAcceleratorErrorAnOom:
         assert peak.failed is False
 
     def test_any_other_accelerator_error_is_still_an_instrument_failure(self):
-        import torch
-
         from soup_cli.utils.layer_stream_runtime import measure_step_peak_bytes
 
         peak = measure_step_peak_bytes(
-            self._model_raising(
-                torch.AcceleratorError("CUDA error: an illegal memory access was encountered")
-            ),
+            self._model_raising("CUDA error: an illegal memory access was encountered"),
             rows=1,
             seq_len=8,
             vocab_size=32,
