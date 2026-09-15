@@ -2467,6 +2467,13 @@ def install_streaming(
 
         large_cls = _streamed_large_layer_class()
         if input_module is output_module:
+            # UNEXERCISED by the test suite, deliberately (#1010 review): no
+            # supported architecture returns ONE module object for both
+            # boundaries -- a tied Llama shares the Parameter, not the module,
+            # and takes the resident path above -- so this branch has no fixture
+            # and its `named_modules()` memo de-duplication (one wrapper reached
+            # under two attribute names yields once, as torch's own walk would)
+            # is read, not run. Kept for the architecture that does share it.
             if embed_key != output_key:
                 raise ValueError("one module cannot represent two untied large-layer weights")
             shared = large_cls(input_module, embed_key, large_pool)
