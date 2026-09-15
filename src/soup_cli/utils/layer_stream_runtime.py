@@ -357,9 +357,7 @@ class RamSource:
             self.store.append(held)
 
     @staticmethod
-    def spec_from_shard(
-        shard_dir: str, idx: int = 0
-    ) -> Dict[str, Tuple[Tuple[int, ...], str]]:
+    def spec_from_shard(shard_dir: str, idx: int = 0) -> Dict[str, Tuple[Tuple[int, ...], str]]:
         """Shape AND dtype for ONE decoder layer, read from the shard header.
 
         The dtype is read per tensor rather than taken from ``index.dtype``: an
@@ -394,7 +392,7 @@ class RamSource:
 
     @staticmethod
     def merge_layer_specs(
-        layer_specs: Sequence[Mapping[str, Tuple[Tuple[int, ...], str]]]
+        layer_specs: Sequence[Mapping[str, Tuple[Tuple[int, ...], str]]],
     ) -> Dict[str, Tuple[Tuple[int, ...], str]]:
         merged: Dict[str, Tuple[Tuple[int, ...], str]] = {}
         for idx, spec in enumerate(layer_specs):
@@ -422,9 +420,7 @@ class RamSource:
             return [spec] * n_layers
         layer_specs = list(spec)
         if len(layer_specs) != n_layers:
-            raise ValueError(
-                f"expected {n_layers} layer specs, but got {len(layer_specs)}"
-            )
+            raise ValueError(f"expected {n_layers} layer specs, but got {len(layer_specs)}")
         return layer_specs
 
     @staticmethod
@@ -492,9 +488,7 @@ class DiskSource:
         # open, everything opened before it must still be closed.
         try:
             self._handles = [
-                self._stack.enter_context(
-                    safe_open(paths[idx], framework="pt")
-                )
+                self._stack.enter_context(safe_open(paths[idx], framework="pt"))
                 for idx in range(n_layers)
             ]
         except BaseException:
@@ -574,9 +568,7 @@ def extras_resident_bytes(shard_dir: str) -> int:
     return total
 
 
-def large_layer_specs(
-    shard_dir: str, index: Any
-) -> Dict[str, Tuple[Tuple[int, ...], str]]:
+def large_layer_specs(shard_dir: str, index: Any) -> Dict[str, Tuple[Tuple[int, ...], str]]:
     """Shape and dtype for the streamed embedding/head shards."""
     from safetensors import safe_open
 
@@ -686,9 +678,9 @@ class LayerBufferPool:
         else:
             self.active_keys_by_layer = [tuple(keys) for keys in active_keys_by_layer]
         self.loads = 0
-        self.nbytes = sum(
-            buf.numel() * buf.element_size() for buf in self.buffers[0].values()
-        ) * self.n
+        self.nbytes = (
+            sum(buf.numel() * buf.element_size() for buf in self.buffers[0].values()) * self.n
+        )
 
     def slot_for(self, idx: int) -> int:
         return idx % self.n
@@ -812,8 +804,7 @@ class LargeLayerBufferPool:
 
         if self.owner != key:
             raise RuntimeError(
-                f"large-layer scheduler bug: slot holds {self.owner!r}, but {key!r} "
-                "was requested"
+                f"large-layer scheduler bug: slot holds {self.owner!r}, but {key!r} was requested"
             )
         if self.is_cuda and self.event is not None:
             torch.cuda.current_stream().wait_event(self.event)
@@ -913,9 +904,7 @@ def _build_streamed_layer_class():
             # v0.72.3 — the mirror of the state_dict() override below.
             self._register_load_state_dict_pre_hook(self._redirect_canonical_keys)
 
-        def _redirect_canonical_keys(
-            self, state_dict, prefix, *_args: Any, **_kwargs: Any
-        ) -> None:
+        def _redirect_canonical_keys(self, state_dict, prefix, *_args: Any, **_kwargs: Any) -> None:
             # v0.72.1 made SAVING canonical; this makes LOADING accept the same
             # keys, which is what `--resume` needs.
             #
@@ -949,11 +938,9 @@ def _build_streamed_layer_class():
             # here is an intermediate one, never the caller's own.
             inner_prefix = prefix + "inner."
             for key in [
-                k
-                for k in state_dict
-                if k.startswith(prefix) and not k.startswith(inner_prefix)
+                k for k in state_dict if k.startswith(prefix) and not k.startswith(inner_prefix)
             ]:
-                redirected = inner_prefix + key[len(prefix):]
+                redirected = inner_prefix + key[len(prefix) :]
                 value = state_dict.pop(key)
                 if redirected in state_dict:
                     # A checkpoint carrying BOTH spellings of one weight is
@@ -1045,9 +1032,7 @@ def _build_streamed_layer_class():
 
         def forward(self, hidden_states: Any, *args: Any, **kwargs: Any) -> Any:
             if self.use_checkpoint and torch.is_grad_enabled():
-                return checkpoint(
-                    self._body, hidden_states, *args, use_reentrant=False, **kwargs
-                )
+                return checkpoint(self._body, hidden_states, *args, use_reentrant=False, **kwargs)
             return self._body(hidden_states, *args, **kwargs)
 
         def _substituted_weights(self, buffers: Any) -> Any:
@@ -1426,8 +1411,7 @@ def measure_step_peak_bytes(
         return None
     if rows < 1 or seq_len < 1 or vocab_size < 1:
         raise ValueError(
-            f"rows/seq_len/vocab_size must all be >= 1; got "
-            f"{rows}/{seq_len}/{vocab_size}"
+            f"rows/seq_len/vocab_size must all be >= 1; got {rows}/{seq_len}/{vocab_size}"
         )
     ids = None
     out = None
@@ -1874,9 +1858,7 @@ def materialize_meta_adapter_copy(
         copied += 1
 
     stranded = [
-        name
-        for name, param in model.named_parameters()
-        if target_marker in name and param.is_meta
+        name for name, param in model.named_parameters() if target_marker in name and param.is_meta
     ]
     if stranded:
         raise RuntimeError(
@@ -2083,8 +2065,7 @@ def install_streaming(
             for key in wanted:
                 if key not in shard_spec:
                     raise ValueError(
-                        f"shard is missing the NF4 sidecar {key!r} — reshard the "
-                        f"checkpoint"
+                        f"shard is missing the NF4 sidecar {key!r} — reshard the checkpoint"
                     )
                 needed[key] = shard_spec[key]
             if spec_q is not None:
@@ -2093,9 +2074,7 @@ def install_streaming(
         active_keys_by_layer.append(tuple(sorted(needed)))
     spec = RamSource.merge_layer_specs(needed_specs_by_layer)
 
-    large_source_indices = {
-        key: n_layers + offset for offset, key in enumerate(large_keys)
-    }
+    large_source_indices = {key: n_layers + offset for offset, key in enumerate(large_keys)}
     source_specs = needed_specs_by_layer + [{key: large_specs[key]} for key in large_keys]
     source_paths = [layer_shard_path(shard_dir, idx) for idx in range(n_layers)] + [
         large_shard_path(shard_dir, key) for key in large_keys
@@ -2153,18 +2132,14 @@ def install_streaming(
         input_module = model.get_input_embeddings()
         output_module = model.get_output_embeddings()
         if input_module is None or output_module is None:
-            raise RuntimeError(
-                "layer streaming needs both input and output embedding modules"
-            )
+            raise RuntimeError("layer streaming needs both input and output embedding modules")
         for role, module, key in (
             ("input embedding", input_module, embed_key),
             ("output head", output_module, output_key),
         ):
             weight = getattr(module, "weight", None)
             if key is None or weight is None or not getattr(weight, "is_meta", False):
-                raise RuntimeError(
-                    f"streamed {role} is not an unmaterialised meta weight"
-                )
+                raise RuntimeError(f"streamed {role} is not an unmaterialised meta weight")
             expected_shape = tuple(large_specs[key][0])
             if tuple(weight.shape) != expected_shape:
                 raise ValueError(
@@ -2215,6 +2190,95 @@ def install_streaming(
     )
 
 
+def _is_out_of_memory(exc: BaseException) -> bool:
+    """``torch.OutOfMemoryError`` and ``AcceleratorError`` are both RuntimeErrors;
+    the text is what they share (mirrors ``batch_probe._is_cuda_oom``)."""
+    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+
+
+def drain_stale_cuda_error(device: str = "cuda", *, launch: Any = None) -> bool:
+    """#901 — consume the stale error a failed page-lock leaves on the CUDA runtime.
+
+    ``cuMemHostAlloc`` refusing a ``pin_memory=True`` allocation raises
+    ``AcceleratorError("CUDA error: out of memory")`` and leaves the runtime's
+    per-thread last error set. Measured on the dev box after such a failure:
+    ``cudaMalloc``, ``synchronize`` and a host-to-device copy all succeed, and the
+    FIRST kernel launch raises that same "out of memory" with 7.3 GB of VRAM
+    free, because its launch check reads the stale value — and clears it, so
+    the second launch works. In the report that first launch was the adapter
+    cast inside ``SFTTrainer.__init__``; with the probe on it was the forward.
+
+    torch exposes no ``cudaGetLastError``, so this launches one trivial kernel
+    to let its check consume the error, then a second to prove the context is
+    healthy. Returns True when a stale error was drained. A launch that fails
+    for any other reason, or twice, propagates: that is a context which is
+    genuinely broken or genuinely out of memory, and hiding it would recreate
+    the silent failure this exists to end. ``launch`` is injectable for tests;
+    the default is a no-op without a CUDA device, where nothing was pinned.
+    """
+    if launch is None:
+        import torch
+
+        if not torch.cuda.is_available():
+            return False
+
+        def launch() -> None:
+            torch.ones(1, device=device)
+            torch.cuda.synchronize(device)
+
+    try:
+        launch()
+    except RuntimeError as exc:
+        if not _is_out_of_memory(exc):
+            raise
+    else:
+        return False
+    launch()
+    return True
+
+
+def release_cached_pinned_memory() -> int:
+    """Return the page-locked blocks torch's caching host allocator kept.
+
+    A pinned tensor that is freed goes back to that cache, not to the OS, so
+    the blocks a partially pinned store allocated before its page-lock failed
+    stay page-locked for the rest of the process — gigabytes on a 14B store,
+    beside the pageable store that replaced it. Returns the bytes released, or
+    0 when the stats or the cache call are unavailable.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return 0
+    empty = getattr(torch._C, "_host_emptyCache", None)
+    if empty is None:  # pragma: no cover - torch without the host-cache call
+        return 0
+    stats = getattr(torch.cuda, "host_memory_stats", None)
+    before = int(stats().get("allocated_bytes.current", 0)) if stats else 0
+    empty()
+    after = int(stats().get("allocated_bytes.current", 0)) if stats else 0
+    return max(0, before - after)
+
+
+def recover_from_failed_page_lock(*, device: str = "cuda", console: Any = None) -> bool:
+    """What a pageable fallback owes the run before it builds anything (#901)."""
+    drained = drain_stale_cuda_error(device)
+    released = release_cached_pinned_memory()
+    if not drained and not released:
+        return False
+    parts = []
+    if drained:
+        parts.append("cleared the stale CUDA out-of-memory error it left on the runtime")
+    if released:
+        parts.append(f"released {released / 1e9:.2f} GB of page-locked memory it left cached")
+    message = f"after the failed page-lock: {' and '.join(parts)}."
+    if console is not None:
+        console.print(f"[dim]{message}[/]")
+    else:
+        logger.info(message)
+    return drained
+
+
 def _build_source(
     shard_dir,
     n_layers,
@@ -2262,9 +2326,7 @@ def _build_source(
         open_kwargs = dict(read_ahead=read_ahead, **source_kwargs)
         if pin:
             try:
-                source = AsyncDiskSource(
-                    shard_dir, n_layers, spec, pin=True, **open_kwargs
-                )
+                source = AsyncDiskSource(shard_dir, n_layers, spec, pin=True, **open_kwargs)
             except (RuntimeError, MemoryError) as exc:
                 # Staging is allocated before the reader thread starts, so a
                 # constructor that raised here owns no thread and no buffers —
@@ -2296,6 +2358,10 @@ def _build_source(
                     console.print(f"[yellow]{message}[/]")
                 else:
                     logger.warning(message)
+                # #901 — BEFORE the pageable retry: the failed page-lock leaves
+                # a stale CUDA error that the run's first kernel launch would
+                # otherwise report as an out-of-memory it never had.
+                recover_from_failed_page_lock(console=console)
             else:
                 return source, source.pinned
         source = AsyncDiskSource(shard_dir, n_layers, spec, pin=False, **open_kwargs)
@@ -2335,6 +2401,13 @@ def _build_source(
             console.print(f"[yellow]{message}[/]")
         else:
             logger.warning(message)
+        # #901 — the fallback was dead on arrival without this: the failed
+        # page-lock leaves a stale CUDA error, and the first kernel launch of
+        # the run (in the report, `param.data.to(bfloat16)` in
+        # SFTTrainer.__init__) reported it as an out-of-memory with gigabytes
+        # free. Drain it, and give back the page-locked blocks the abandoned
+        # attempt left in torch's host cache, before building the store.
+        recover_from_failed_page_lock(console=console)
         source = RamSource(shard_dir, n_layers, spec, pin=False, **source_kwargs)
         return source, source.pinned
 
@@ -2353,9 +2426,7 @@ def _spec_bytes(
     else:
         layer_specs = list(spec)
         if len(layer_specs) != n_layers:
-            raise ValueError(
-                f"expected {n_layers} layer specs, but got {len(layer_specs)}"
-            )
+            raise ValueError(f"expected {n_layers} layer specs, but got {len(layer_specs)}")
     return sum(
         math.prod(shape) * _dtype_size(dtype)
         for layer_spec in layer_specs
@@ -2398,9 +2469,7 @@ def build_streamed_model(
     external_sources: Tuple[Any, ...] = ()
     if external_tensors:
         if weights_dir is None:
-            raise ValueError(
-                "a Qwen4 shard index with external PLE tensors requires weights_dir"
-            )
+            raise ValueError("a Qwen4 shard index with external PLE tensors requires weights_dir")
         from soup_cli.utils.qwen4_ple import install_qwen4_ple_embeddings
 
         external_sources = install_qwen4_ple_embeddings(
@@ -2410,9 +2479,7 @@ def build_streamed_model(
             source=ngram_source,
         )
     try:
-        extras = materialize_extras(
-            model, shard_dir, index, device=device, dtype=dtype
-        )
+        extras = materialize_extras(model, shard_dir, index, device=device, dtype=dtype)
         for param in model.parameters():
             param.requires_grad = False
         from soup_cli.utils.peft_wiring import apply_pre_lora_patches
