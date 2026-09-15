@@ -126,7 +126,15 @@ def load_corpus(spec: str, fields: Sequence[str], limit: Optional[int]) -> List[
         return _read_hf_text(spec, limit)
     if os.path.isdir(spec):
         out: List[str] = []
-        for root, _dirs, names in os.walk(spec):
+        for root, dirs, names in os.walk(spec):
+            # Sorted IN PLACE, which is what makes os.walk deterministic: it
+            # yields directories in filesystem order otherwise, and on the dev
+            # box that order is not sorted (data/providers before
+            # data/_fixtures), so the same directory would concatenate
+            # differently on another machine and move every number that reads
+            # it. Note this CHANGES the order relative to results published
+            # before it, which is why those carry their own corpus digest.
+            dirs.sort()
             for name in sorted(names):
                 if name.endswith((".py", ".md", ".txt")):
                     full = os.path.join(root, name)
@@ -139,6 +147,44 @@ def load_corpus(spec: str, fields: Sequence[str], limit: Optional[int]) -> List[
         return _read_jsonl_text(spec, fields, limit)
     with open(spec, "r", encoding="utf-8", errors="replace") as handle:
         return [handle.read()]
+
+
+def corpus_revision(spec: str) -> Optional[str]:
+    """The git commit of a DIRECTORY corpus, when it is inside a repository.
+
+    A directory corpus is not a fixture: it is whatever the tree holds at the
+    moment it is read. Measured the hard way -- two runs of one configuration 43
+    minutes apart disagreed on the code corpus because `origin/main` had been
+    merged in between, changing 13 files under it, and the per-expert counts
+    moved by 6.7e-03 while prose and math reproduced to 0.000e+00. The digest
+    already caught it; this says WHICH tree, so the difference is explicable
+    rather than merely visible.
+    """
+    if spec.startswith("hf:") or not os.path.isdir(spec):
+        return None
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["git", "-C", spec, "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover
+        return None
+    revision = out.stdout.strip()
+    if out.returncode != 0 or not revision:
+        return None
+    dirty = subprocess.run(
+        ["git", "-C", spec, "status", "--porcelain", "--", "."],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    return revision + ("-dirty" if dirty.stdout.strip() else "")
 
 
 def pack_token_stream(texts: Sequence[str], tokenizer, seq: int, seed: int) -> "Any":
@@ -638,6 +684,7 @@ def main() -> int:
             "spec": spec,
             "documents": len(texts),
             "sha256_16": digest,
+            "git_revision": corpus_revision(spec),
             "shapes": {},
         }
         for batch, seq in shapes:

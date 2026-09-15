@@ -281,7 +281,10 @@ word. Fixed forward rather than argued - `host_state()` and
 `harness_fingerprint()` now record available RAM, swap, the Python process count
 and a SHA-256 of the harness itself into `meta.host_before` / `meta.host_after`
 of every run, so a future result carries its own box state and names the code
-that produced it.
+that produced it. **`granite_bf16_cuda_run2.json` is the first block that
+carries one** — available RAM 17.78 GB before and 16.86 GB after, 3 Python
+processes, harness `61b9a4be` — and run 1 does not, which is why both are
+published.
 
 **And it should be said plainly that none of this can move a number here.** A
 routing count is deterministic given the weights and the tokens: the top-k of a
@@ -344,6 +347,53 @@ Per layer, corpus `code`, shape `1x512` (chance baseline 1.000000):
 | 15 | 0.909 | 58.2 / 64 | 0.635 | 0.477 | 0.734 | 0.963 | 0.734 |
 
 Verdict inputs: **C = 0.967 to 1.000** over 9 corpus/shape combinations; **S = 0.413 to 0.668**.
+
+### Finding 0 — the measurement reproduces exactly, and finding out cost a corpus
+
+granite was run a second time at 20:36, 41 minutes after the first, with the
+identical configuration — same model, same three corpora, same three shapes,
+same 16 steps, same seed 17 — published as
+`granite_bf16_cuda_run2.json` beside run 1 rather than replacing it. Routing is
+deterministic given the weights and the tokens, so two runs of one configuration
+must agree EXACTLY, and a difference is a finding rather than noise. Suggested
+in review, and it earned its keep immediately.
+
+| corpus | same text? | per-expert counts | largest difference in any statistic |
+|---|---|---|---|
+| prose | yes (`399831ef40995321`) | **identical at every layer and shape** | **0.000e+00** |
+| math | yes (`21b099a4d0676f55`) | **identical at every layer and shape** | **0.000e+00** |
+| code | **NO** (`111769fb…` -> `e2213959…`) | differ | 6.741e-03 |
+
+**Where the input was identical, the output is identical to the last bit** —
+per-expert counts, not merely rounded summaries. That is the strongest form the
+reproducibility check can take, and it is what licenses reading a 0.997 here as
+a measurement rather than a sample.
+
+**Where it was not identical, the cause is mine and it is a design fault worth
+publishing.** The code corpus is not a fixture: it is this repository's own
+`src/soup_cli`, read live. Between the two runs I merged `origin/main` into the
+branch, which changed 13 files under that directory (+799 / -212 lines,
+including #989's layer-stream work). So the corpus moved, and the statistics
+moved with it by 6.7e-03. **Nothing about the model changed; the text did.**
+
+Three things follow, and the first two are already in the harness:
+
+- the corpus digest is what caught it, and it caught it on first use — a
+  comparison that could not fail would have been worth nothing;
+- a directory corpus now records its **git revision** (`meta.corpora[].git_revision`,
+  with a `-dirty` suffix when the tree is modified), so the next such difference
+  is explicable rather than merely visible;
+- `os.walk` was yielding directories in filesystem order, which on this box is
+  **not** sorted (`data/providers` before `data/_fixtures`), so the same
+  directory would concatenate differently on another machine. Now sorted in
+  place. **This changes the code corpus's order relative to both published
+  runs**, so a third run will produce a third digest — which is exactly why each
+  result carries its own.
+
+The honest reading of the code-corpus rows in the tables below is therefore:
+they describe a real corpus of real Python, at a stated tree, and they are not
+reproducible from the repository name alone. Prose and math are, and they
+reproduced.
 
 ### Finding 1 — a training step touches essentially every expert, at every shape, on both models
 
