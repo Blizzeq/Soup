@@ -92,6 +92,19 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _transformers_version() -> str:
+    """A PARSEABLE version string. ``"synthetic"`` here made ``AutoTokenizer``
+    (not ``AutoConfig``, which the streaming harness uses) die with
+    ``InvalidVersion`` the moment a tokenizer was dropped beside the checkpoint
+    for an end-to-end ``soup train``; ``_soup_synthetic`` is the marker."""
+    try:
+        import transformers
+
+        return str(transformers.__version__)
+    except Exception:  # noqa: BLE001 - the generator needs only torch
+        return "4.45.0"
+
+
 def config_dict(shape: Dict[str, int], arch: str = "llama") -> Dict[str, Any]:
     common = {
         "hidden_size": shape["hidden"],
@@ -104,7 +117,7 @@ def config_dict(shape: Dict[str, int], arch: str = "llama") -> Dict[str, Any]:
         "tie_word_embeddings": False,
         "torch_dtype": "bfloat16",
         "use_cache": False,
-        "transformers_version": "synthetic",
+        "transformers_version": _transformers_version(),
         "_soup_synthetic": True,
     }
     if arch == "qwen2":
