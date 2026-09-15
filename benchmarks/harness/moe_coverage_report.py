@@ -116,12 +116,88 @@ def verdict_inputs(data: Dict[str, Any]) -> List[str]:
     ]
 
 
+def compare(left_path: str, right_path: str) -> List[str]:
+    """Two runs of the same configuration, differenced statistic by statistic.
+
+    A routing count is deterministic: same weights, same tokens, same seed means
+    the same top-k, so two runs of one configuration must agree EXACTLY. That
+    makes a re-run a reproducibility check rather than an errand, and any
+    difference a finding rather than noise. The corpus digests are compared
+    first, because a difference there explains everything after it and means
+    nothing else in the comparison is about the model.
+    """
+    left = json.loads(pathlib.Path(left_path).read_text(encoding="utf-8"))
+    right = json.loads(pathlib.Path(right_path).read_text(encoding="utf-8"))
+    lines = [
+        f"### {pathlib.Path(left_path).name} vs {pathlib.Path(right_path).name}",
+        "",
+        f"harness sha256: {left['meta'].get('harness_sha256_16', 'not recorded')} vs "
+        f"{right['meta'].get('harness_sha256_16', 'not recorded')}",
+        f"host state recorded: {'host_before' in left['meta']} vs "
+        f"{'host_before' in right['meta']}",
+        "",
+    ]
+    keys = (
+        "coverage_mean_over_layers",
+        "coverage_min_layer",
+        "coverage_max_layer",
+        "gini_mean_over_layers",
+        "traffic_caught_by_previous_layers_set_mean",
+        "traffic_caught_by_corpus_hot25_mean",
+    )
+    worst = 0.0
+    digests_differ = []
+    for one, two in zip(left["corpora"], right["corpora"]):
+        if one["sha256_16"] != two["sha256_16"]:
+            digests_differ.append(f"{one['label']} ({one['sha256_16']} vs {two['sha256_16']})")
+        for shape in one["shapes"]:
+            a, b = one["shapes"][shape], two["shapes"][shape]
+            for key in keys:
+                if a.get(key) is None or b.get(key) is None:
+                    continue
+                worst = max(worst, abs(a[key] - b[key]))
+            for row_a, row_b in zip(a["layers"], b["layers"]):
+                if row_a["counts"] != row_b["counts"]:
+                    lines.append(
+                        f"- **per-expert counts differ** at {one['label']} {shape} "
+                        f"layer {row_a['layer']}"
+                    )
+    if digests_differ:
+        lines.append(
+            "- **corpus digests differ**: " + ", ".join(digests_differ) + " - the two runs "
+            "did not read the same text, so nothing below is about the model"
+        )
+    lines.append(f"- largest difference in any summary statistic: **{worst:.2e}**")
+    lines.append(
+        "- per-expert counts identical at every layer of every corpus and shape"
+        if not any("counts differ" in line for line in lines)
+        else "- per-expert counts DIFFER somewhere; see above"
+    )
+    return lines
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("json", nargs="+", help="result files from moe_expert_coverage.py")
     parser.add_argument("--layer-corpus", default="prose")
     parser.add_argument("--layer-shape", default="4x512")
+    parser.add_argument(
+        "--compare",
+        action="store_true",
+        help=(
+            "difference exactly two results of the SAME configuration instead of "
+            "tabulating them. Routing is deterministic, so they must agree exactly; "
+            "a difference is a finding"
+        ),
+    )
     args = parser.parse_args()
+
+    if args.compare:
+        if len(args.json) != 2:
+            parser.error("--compare wants exactly two result files")
+        for line in compare(args.json[0], args.json[1]):
+            print(line)
+        return 0
 
     for path in args.json:
         data = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
