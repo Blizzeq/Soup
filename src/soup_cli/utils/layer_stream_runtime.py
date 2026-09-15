@@ -2405,9 +2405,16 @@ def release_cached_pinned_memory() -> int:
     if empty is None:  # pragma: no cover - torch without the host-cache call
         return 0
     stats = getattr(torch.cuda, "host_memory_stats", None)
-    before = int(stats().get("allocated_bytes.current", 0)) if stats else 0
-    empty()
-    after = int(stats().get("allocated_bytes.current", 0)) if stats else 0
+    try:
+        before = int(stats().get("allocated_bytes.current", 0)) if stats else 0
+        empty()
+        after = int(stats().get("allocated_bytes.current", 0)) if stats else 0
+    except Exception as exc:  # noqa: BLE001 - a private API with no contract
+        # Reported, never raised: this runs inside the page-lock fallback, and
+        # an error here would replace "could not page-lock the base" with one
+        # about the recovery. The cache staying full costs RAM, not correctness.
+        logger.warning("could not release torch's cached pinned memory: %r", exc)
+        return 0
     return max(0, before - after)
 
 

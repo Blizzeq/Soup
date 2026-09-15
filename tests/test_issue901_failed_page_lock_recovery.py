@@ -119,6 +119,36 @@ class TestDrainStaleCudaError:
         assert drain_stale_cuda_error("cuda") is False
 
 
+class TestRecoveryHelpersOffTheHappyPath:
+    """The two helpers around the drain, on the paths CI can reach (security
+    review, 2026-09-15): without a CUDA device the recovery is a quiet no-op,
+    and a private host-cache call that raises is reported as nothing released
+    rather than replacing the page-lock error with one about the recovery."""
+
+    def test_without_a_cuda_device_the_recovery_is_a_quiet_no_op(self, monkeypatch):
+        import torch
+
+        from soup_cli.utils.layer_stream_runtime import recover_from_failed_page_lock
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        console = _Console()
+        assert recover_from_failed_page_lock(device="cuda", console=console) is False
+        assert console.printed == []
+
+    def test_a_raising_host_cache_call_reports_nothing_released(self, monkeypatch):
+        import torch
+
+        from soup_cli.utils.layer_stream_runtime import release_cached_pinned_memory
+
+        def boom():
+            raise RuntimeError("private API moved")
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch._C, "_host_emptyCache", boom, raising=False)
+        monkeypatch.setattr(torch.cuda, "host_memory_stats", lambda: {}, raising=False)
+        assert release_cached_pinned_memory() == 0
+
+
 class TestTheFallbackRecoversBeforeBuildingThePageableStore:
     """``_build_source``: the recovery runs BETWEEN the failed pinned constructor
     and the pageable one, on both tiers. After the pageable store is built the
