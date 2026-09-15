@@ -56,6 +56,7 @@ import argparse
 import hashlib
 import json
 import os
+import pathlib
 import sys
 import time
 from dataclasses import dataclass, field
@@ -252,6 +253,51 @@ def attach_routers(model, n_experts: int, top_k: int) -> List[RouterHook]:
 # =====================================================================
 # Statistics
 # =====================================================================
+def host_state() -> Dict[str, Any]:
+    """What else was on the box, recorded INTO the results rather than beside them.
+
+    A routing count cannot be moved by memory pressure -- the top-k of a router
+    is deterministic given the weights and the tokens -- so this is not a
+    correction to any number here. It is provenance: a record whose box state
+    comes from a wrapper that was never committed is a record a reader cannot
+    check, which is what the review of PR #992 found. Recorded before and after
+    every model.
+
+    ``python_processes`` counts processes whose name starts with "python",
+    which on Windows includes the venv launcher's redirector as well as the
+    interpreter it starts -- one logical run can therefore show as two.
+    """
+    state: Dict[str, Any] = {"at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    try:
+        import psutil
+    except ImportError:
+        state["note"] = "psutil not installed; host state not recorded"
+        return state
+    memory = psutil.virtual_memory()
+    state["available_gb"] = round(memory.available / 1e9, 2)
+    state["memory_used_percent"] = memory.percent
+    try:
+        state["swap_used_gb"] = round(psutil.swap_memory().used / 1e9, 2)
+    except (OSError, RuntimeError):  # pragma: no cover - platform dependent
+        state["swap_used_gb"] = None
+    count = 0
+    for process in psutil.process_iter(["name"]):
+        name = (process.info.get("name") or "").lower()
+        if name.startswith("python"):
+            count += 1
+    state["python_processes"] = count
+    return state
+
+
+def harness_fingerprint() -> str:
+    """SHA-256 of this file, so a result names the code that produced it.
+
+    Today's lesson twice over: a run that does not record which source tree it
+    imported is a run whose arm cannot be proved afterwards.
+    """
+    return hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()[:16]
+
+
 def uniform_coverage(n_experts: int, top_k: int, tokens: int) -> float:
     """Expected coverage if every token picked ``top_k`` experts uniformly.
 
@@ -576,6 +622,8 @@ def main() -> int:
             "batches_per_shape": args.batches,
             "shapes": [f"{b}x{s}" for b, s in shapes],
             "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "harness_sha256_16": harness_fingerprint(),
+            "host_before": host_state(),
         },
         "corpora": [],
     }
@@ -616,6 +664,7 @@ def main() -> int:
             )
         results["corpora"].append(entry)
 
+    results["meta"]["host_after"] = host_state()
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as handle:
         json.dump(results, handle, indent=1)

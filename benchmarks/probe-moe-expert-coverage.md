@@ -17,10 +17,18 @@ Harness: benchmarks/harness/moe_expert_coverage.py (committed with this file).
 expert of every layer — C = 0.967 to 1.000 across two models, three corpora and
 three batch shapes — so expert-granularity streaming saves memory and NOT reads,
 and the rule committed here before the run says to ship it, if at all, as a
-capacity tier with no throughput promise.** The rule in §2 was committed in
-4908d52b, before any model was downloaded; the numbers arrived in §5 afterwards.
-That ordering is checkable in `git log` and is the reason this record is worth
-anything.
+capacity tier with no throughput promise.**
+
+**The rule's provenance, stated precisely because a reviewer checked it and the
+first version of this paragraph was not.** §2 was first committed in
+**4908d52b** (16:44) and **amended in 8d0ff678** (18:48), which rewrote "that
+predictability is NOT measured in step 0" into "is measured in step 0 after all"
+and added the two prefetch predictors and the fourth rule row. The first model
+was downloaded at **19:53**, so both commits predate every number here and the
+pre-registration survives - but the record has to say the rule was edited rather
+than let "committed in 4908d52b" imply it never was. Nothing in the rule has been
+touched since the numbers arrived, which is the property that matters and which
+`git log` can check.
 
 ---
 
@@ -36,8 +44,10 @@ Whether that is worth building turns on one number, and `.claude/plan.md` states
 the trap plainly: if a step's token batch routes to nearly every expert anyway,
 **the read volume does not fall** and only the memory bound improves. Our step
 reads the stack twice (forward, then the backward recompute), so on a 744B store
-that is ~600 GB per step; at the 4.5-5.1 GB/s the disk tier reaches after #974
-that is around two minutes per step even if nothing else got worse.
+that is ~600 GB per step; at the ~4.3 GB/s the disk tier averages on a COLD 70B
+step after #974 - the 4.5-5.1 GB/s figure is the warm 7B rate, corrected here
+after review - that is around two minutes per step even if nothing else got
+worse.
 
 So: **union coverage** — the fraction of a layer's experts that at least one
 token in the step routes to — measured per layer, on a real model, on real text,
@@ -247,10 +257,37 @@ caveat with a number.
 
 Measured 2026-09-15 19:53-20:19 local, on a box with nothing else running: a
 peer session's cold 70B series had finished and its author confirmed the machine
-free. Host baseline stamped either side of every block; the widest excursion over
-the whole run was free physical 18.78-20.56 GB, commit 22.47-24.01 GB of a 53.45
-GB limit, 2 Python processes throughout. Raw JSON under
-`benchmarks/results/probe-rtx5070/moe/`.
+free. Raw JSON under `benchmarks/results/probe-rtx5070/moe/`.
+
+**Box state, and where each number comes from** - a reviewer asked, and the
+answer was not in the record. Free physical RAM 18.78-20.56 GB, commit charge
+21.38-24.01 GB of a 53.45 GB limit, **2 Python processes throughout**, sampled
+either side of all three blocks. Those came from a shell wrapper that is
+deliberately NOT committed (§8) and were therefore, as originally written,
+unverifiable by a reader.
+
+Two things about that, one narrower than the review assumed and one wider. The
+**narrower**: the wrapper's broken query and its box stamp are different
+mechanisms. What could not fire was its neighbour check, a
+`Get-CimInstance Win32_Process -Filter` whose nested quotes were malformed; the
+stamp used `Get-CimInstance Win32_OperatingSystem` plus
+`Get-Process python | Measure-Object`, neither of which errored. The stamp is
+also positively controlled rather than merely un-errored: run again at 20:27:10
+while a peer's ablation was on the card it returned 4 Python processes, and at
+20:20:40 with nothing running it returned 2. It discriminates.
+
+The **wider**: none of that was in the results, so a reader still had to take my
+word. Fixed forward rather than argued - `host_state()` and
+`harness_fingerprint()` now record available RAM, swap, the Python process count
+and a SHA-256 of the harness itself into `meta.host_before` / `meta.host_after`
+of every run, so a future result carries its own box state and names the code
+that produced it.
+
+**And it should be said plainly that none of this can move a number here.** A
+routing count is deterministic given the weights and the tokens: the top-k of a
+router does not depend on how much RAM was free. Memory pressure could have made
+the run slower, and there are no timing claims in this record. This paragraph is
+about whether the record can be checked, not about whether the result is right.
 
 Every figure below is a mean over the model's layers, over 16 steps per shape.
 **The chance baseline is 1.000 to three decimals for every row in both tables**,
@@ -381,10 +418,20 @@ The largest per-layer coverage difference anywhere is **0.0068**, at layer 7.
 two arms differ in four ways at once**: precision (NF4 against bf16), device
 (cuda against cpu), step count (16 against 4) and corpus slice (4000 rows
 against 1500, and the record's own sha256 of the two differs). So the ~0.004
-agreement is an upper bound on **all four together**, which is the useful
-direction: whatever NF4 does to routing here is smaller than that, and smaller
-by two orders of magnitude than the corpus-to-corpus spread the same model shows
-(Gini 0.271 on prose against 0.558 on code).
+agreement constrains **all four together**, which is the useful direction:
+whatever NF4 does to routing here is two orders of magnitude smaller than the
+corpus-to-corpus spread the same model shows (Gini 0.271 on prose against 0.558
+on code).
+
+**"Bound" was the wrong word and the review was right to press on it.** Four
+differences agreeing to 0.004 is not a bound unless they cannot cancel, and
+nothing here proves they cannot. What makes cancellation implausible rather than
+excluded is that **four different metrics agree simultaneously** - coverage,
+worst layer, Gini and the quartile share - so a cancellation would have to hold
+across all of them at once. The tighter control exists and was not run: bf16 on
+CPU over the same 4000-row slice at 16 steps leaves only precision and device,
+at ~25 minutes of CPU. The verdict does not turn on it, since the means are
+0.967-1.000 against a 0.85 threshold.
 
 The router itself was never quantised — in transformers 5.17 a top-k router
 holds its weight as a bare `nn.Parameter` used through `F.linear`, so
@@ -404,6 +451,20 @@ streamed bytes fall to `coverage - f`, i.e. **by `f`**. Keeping the busiest
 quartile of OLMoE's experts resident saves **25% of the read volume**, not the
 67% of *traffic* those experts carry. The traffic share decides whether a hot
 set can be picked at all and whether it is stable; it does not size the saving.
+
+Two consequences, both raised in review of this record and both arithmetic
+rather than measurement:
+
+- **There is one regime where the traffic share WOULD size a saving, and it does
+  not rescue the feature**: micro-batching within a step without caching experts
+  across micro-batches, so a hot expert is re-fetched per micro-batch. That is
+  strictly worse than the batch-union measured here, so it cannot turn a
+  non-saving into a saving; it can only make the un-cached case cost more.
+- **On the class the plan is aimed at, the hybrid tier's saving is about 5%.** A
+  744B-class MoE carries on the order of 600 GB of routed experts, and the
+  fraction an 8 GB card with 32 GB of host RAM can hold resident is roughly 5%.
+  By the arithmetic above the read saving is that fraction. This strengthens the
+  negative rather than softening it.
 
 ## 6. Verdict
 
