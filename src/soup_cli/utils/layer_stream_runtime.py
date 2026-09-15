@@ -1148,7 +1148,9 @@ def _build_streamed_layer_class():
         # tensors with no exception (9 CI cells, every PR, the day 0.21.0 was
         # published). transformers' `get_parameter_names` — the weight-decay
         # grouping — walks `named_children()` and joins the result with
-        # `named_parameters()`, the same hazard one consumer over.
+        # `named_parameters()`: self-consistent before this fix (both spelled
+        # `.inner.`) and broken the moment only `named_modules()` changed, so
+        # the two move together.
         #
         # So the inner layer's subtree is reported at THIS wrapper's prefix,
         # and the wrapper itself is NOT enumerated — `named_modules()` yields
@@ -1164,12 +1166,18 @@ def _build_streamed_layer_class():
         # and a name-keyed patcher (`utils/gradient_ckpt.py`) would patch two
         # objects under one name. `named_parameters()` / `named_buffers()` /
         # `parameters()` derive from `named_modules()` and become canonical
-        # with it. What still uses `_modules` directly — `load_state_dict`'s
-        # recursion, `__repr__`, the `children()`-based traversals — is
-        # handled explicitly: the load-side pre-hook above keeps redirecting
-        # canonical keys into `.inner.`, and the three traversals below reach
-        # `inner` themselves. Naming only: nothing on the streamed forward
-        # path changes, so the bit-exactness gates stay valid un-re-run.
+        # with it. Whatever reads `_modules` directly needs no help and gets
+        # none — `__repr__`, `get_submodule`, `load_state_dict`'s recursion
+        # (for which the load-side pre-hook above keeps redirecting canonical
+        # keys into `.inner.`); whatever goes through `children()` —
+        # `train()`, `apply()`, `_apply()` — is overridden below to reach
+        # `inner` itself. `apply()` deliberately still visits the wrapper too,
+        # AFTER the inner tree: it serves caller-supplied initialisers and
+        # hook installers that should see every object, and the
+        # hasattr/setattr hazard above is specific to the `modules()`- and
+        # name-driven walks; a test pins the opt-back-in. Naming only: nothing
+        # on the streamed forward path changes, so the bit-exactness gates
+        # stay valid un-re-run.
         # ------------------------------------------------------------------
         def named_children(self) -> Any:
             yield from self.inner.named_children()
@@ -1364,6 +1372,23 @@ def _build_streamed_large_layer_class():
         # enumerated under this wrapper's own prefix in place of the wrapper,
         # so `named_parameters()` says `model.embed_tokens.weight` exactly as
         # `state_dict()` does.
+        #
+        # ONE documented exception (found in #1010's review): the inner module
+        # has no children, so `named_children()` yields nothing and this
+        # wrapper owns no `_parameters` — transformers' `get_parameter_names`
+        # (the weight-decay grouping, which walks `named_children()` and reads
+        # each visited module's own `_parameters`) therefore never lists the
+        # streamed large weight, where a resident model lists it. That is
+        # safe, and only because of WHAT the weight is: a frozen meta
+        # placeholder (`requires_grad=False`; the large slot serves the real
+        # bytes), and `Trainer.create_optimizer` filters every group on
+        # `requires_grad`, so the optimizer groups equal a resident model's
+        # exactly — pinned, with the exact name difference, by
+        # tests/test_issue1005_peft021_review_round.py. The alternative,
+        # registering `inner.weight` on this wrapper as well, is WRONG rather
+        # than untidy: `_load_from_state_dict` would then report the canonical
+        # key missing, because the pre-hook above has already renamed it into
+        # `.inner.` by the time the wrapper's own parameters are checked.
         def named_children(self) -> Any:
             yield from self.inner.named_children()
 
@@ -1443,10 +1468,26 @@ def _streamed_large_layer_class():
 def _replace_module_references(root: Any, target: Any, replacement: Any) -> int:
     """Replace every child reference to ``target`` without relying on its path."""
     replaced = 0
-    # Snapshot the original module graph before mutating it.  Iterating the live
-    # graph would visit ``replacement`` after the first assignment and replace
-    # its own ``inner`` reference, making the wrapper its own child.
-    for module in tuple(root.modules()):
+    # Walk the graph STRUCTURALLY (`_modules`, by identity) rather than through
+    # `root.modules()`: since #1005 a streamed wrapper enumerates its inner
+    # layer in its own place, so `modules()` never visits a wrapper and would
+    # skip its `_modules` — inert for today's callers (embed_tokens / lm_head
+    # hang off top-level containers, and every call is guarded by
+    # `if not _replace_module_references(...): raise`), but the docstring's
+    # promise should not depend on that. Snapshot before mutating: visiting
+    # ``replacement`` after the first assignment would replace its own
+    # ``inner`` reference and make the wrapper its own child.
+    seen: set = set()
+    stack = [root]
+    snapshot = []
+    while stack:
+        module = stack.pop()
+        if id(module) in seen:
+            continue
+        seen.add(id(module))
+        snapshot.append(module)
+        stack.extend(child for child in module._modules.values() if child is not None)
+    for module in snapshot:
         # ``named_children()`` removes duplicate modules, but tied architectures
         # may expose the same boundary module through more than one attribute.
         for name, child in tuple(module._modules.items()):

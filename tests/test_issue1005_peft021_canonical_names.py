@@ -226,6 +226,10 @@ class TestConsumersAgree:
         assert reloaded_b and all(torch.all(p == 0.05) for p in reloaded_b), (
             "every lora_B should be 0.05 after the round trip; a zero one was dropped on load"
         )
+        reloaded_a = [p for n, p in reloaded.named_parameters() if "lora_A" in n]
+        assert reloaded_a and all(torch.all(p == 0.025) for p in reloaded_a), (
+            "every lora_A should be 0.025 after the round trip"
+        )
 
     def test_decay_parameter_names_reach_the_lora_parameters(self, pair):
         """transformers builds the weight-decay group by walking named_children()
