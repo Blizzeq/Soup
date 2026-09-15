@@ -95,21 +95,12 @@ def _resolve_qwen4_ngram_source(
         return requested
     ram_budget = free_ram * RAM_TIER_HEADROOM
     base_in_ram = (
-        store_total
-        if stream_source != "disk" and store_total + resident_ram < ram_budget
-        else 0
+        store_total if stream_source != "disk" and store_total + resident_ram < ram_budget else 0
     )
     ram_bytes = base_in_ram + ngram_bytes
     fits_available_ram = ram_bytes + resident_ram < ram_budget
-    physical_limit = (
-        None
-        if total_ram is None
-        else total_ram * PHYSICAL_RAM_TIER_HEADROOM
-    )
-    fits_physical_ram = (
-        physical_limit is None
-        or ram_bytes + resident_ram < physical_limit
-    )
+    physical_limit = None if total_ram is None else total_ram * PHYSICAL_RAM_TIER_HEADROOM
+    fits_physical_ram = physical_limit is None or ram_bytes + resident_ram < physical_limit
     return "ram" if fits_available_ram and fits_physical_ram else "disk"
 
 
@@ -227,9 +218,7 @@ def _validate_stream_staging_ram_fit(
     )
 
 
-def _warn_if_ngram_source_unused(
-    *, arch: str, requested: str, ngram_bytes: int, notify
-) -> None:
+def _warn_if_ngram_source_unused(*, arch: str, requested: str, ngram_bytes: int, notify) -> None:
     """Make a user-supplied PLE policy visible when the checkpoint has no PLE."""
     if arch == "qwen4_exp" and requested != "auto" and not ngram_bytes:
         notify(
@@ -318,13 +307,9 @@ def _render_stream_disk_preflight(
         required = required_by_device[device]
         free = free_by_device[device]
         labels = " + ".join(labels_by_device[device])
-        lines.append(
-            f"Free on target volume ({labels}): {free / 1e9:.2f} GB"
-        )
+        lines.append(f"Free on target volume ({labels}): {free / 1e9:.2f} GB")
         if required > free:
-            console.print(
-                Panel("\n".join(lines), title="Layer streaming disk pre-flight")
-            )
+            console.print(Panel("\n".join(lines), title="Layer streaming disk pre-flight"))
             raise ValueError(
                 f"layer streaming needs {required / 1e9:.2f} GB of additional "
                 f"disk space for {labels}, but only {free / 1e9:.2f} GB is free. "
@@ -443,9 +428,7 @@ class StreamingSetupMixin:
         from soup_cli.utils.layer_stream_runtime import RamSource
 
         merged = RamSource.merge_layer_specs(layer_specs)
-        return sum(
-            math.prod(shape) * dtype_bytes(stored) for shape, stored in merged.values()
-        )
+        return sum(math.prod(shape) * dtype_bytes(stored) for shape, stored in merged.values())
 
     @contextlib.contextmanager
     def _training_context(self, *contexts):
@@ -551,9 +534,7 @@ class StreamingSetupMixin:
         # an untied head stay at `dtype`, exactly as replace_with_bnb_linear
         # leaves them.
         quant = QUANT_NF4 if tcfg.quantization == "4bit" else QUANT_NONE
-        _validate_qwen4_streaming_mode(
-            arch=arch, task=getattr(cfg, "task", "sft"), quant=quant
-        )
+        _validate_qwen4_streaming_mode(arch=arch, task=getattr(cfg, "task", "sft"), quant=quant)
         # #321 — the streamed skeleton and the shards must quantise with the
         # SAME double-quant setting or the streamed-vs-resident bit-exactness
         # claim breaks. Read the flag once here (resolving the tri-state unset to
@@ -707,9 +688,7 @@ class StreamingSetupMixin:
         embed_bytes = extras_resident_bytes(shard_dir)
         large_store_bytes = large_layer_store_bytes(shard_dir, index)
         large_buffer_bytes = large_layer_buffer_bytes(shard_dir, index)
-        ngram_bytes = external_tensor_bytes(
-            getattr(index, "external_tensors", None) or {}
-        )
+        ngram_bytes = external_tensor_bytes(getattr(index, "external_tensors", None) or {})
 
         free_ram = free_ram_bytes()
         total_ram = total_ram_bytes()
@@ -718,17 +697,13 @@ class StreamingSetupMixin:
                 "[yellow]psutil unavailable — cannot size the RAM tier; "
                 "proceeding and letting the allocation fail loudly if it must[/]"
             )
-            free_ram = (
-                layer_bytes * index.n_layers + large_store_bytes + embed_bytes
-            ) * 10
+            free_ram = (layer_bytes * index.n_layers + large_store_bytes + embed_bytes) * 10
 
         store_total = layer_store_bytes + large_store_bytes
         ngram_source = "disk"
         if ngram_bytes:
             requested_ngram = tcfg.stream_ngram_source
-            oq_ngram = any(
-                hasattr(spec, "bits") for spec in index.external_tensors.values()
-            )
+            oq_ngram = any(hasattr(spec, "bits") for spec in index.external_tensors.values())
             ngram_source = _resolve_qwen4_ngram_source(
                 oq_ngram=oq_ngram,
                 requested=requested_ngram,
@@ -745,9 +720,7 @@ class StreamingSetupMixin:
                     weights_dir, tcfg.stream_disk_kind, notify=console.print
                 )
                 ngram_disk_kind = ngram_disk.kind
-                _validate_qwen4_ngram_disk(
-                    disk_kind=ngram_disk_kind, weights_dir=weights_dir
-                )
+                _validate_qwen4_ngram_disk(disk_kind=ngram_disk_kind, weights_dir=weights_dir)
                 storage = f"read-only {ngram_disk_kind.upper()} mmap"
             console.print(
                 f"[cyan]Qwen4 PLE:[/] {ngram_bytes / 1e9:.2f} GB via {storage} "
@@ -892,9 +865,7 @@ class StreamingSetupMixin:
         if on_cuda:
             enabled, why_not = expandable_segments_status()
             if not enabled:
-                console.print(
-                    f"[dim]expandable_segments allocator hint not enabled: {why_not}[/]"
-                )
+                console.print(f"[dim]expandable_segments allocator hint not enabled: {why_not}[/]")
 
         from soup_cli.utils.peft_wiring import (
             build_lora_config,
@@ -962,6 +933,11 @@ class StreamingSetupMixin:
                 f"{stats['store_bytes'] / 1e9:.2f} GB "
                 f"{'pinned' if stats['pinned'] else 'pageable'} RAM store"
             )
+            # #901: page-locked memory is handed out in power-of-two blocks, so
+            # what the box actually pins for the store is not its byte count.
+            # Say the real figure beside it whenever the source knows it.
+            if stats["pinned"] and stats.get("pinned_bytes"):
+                source_line += f" ({stats['pinned_bytes'] / 1e9:.2f} GB page-locked)"
         else:
             # Not "nothing held resident": the async reader stages `read_ahead`
             # layers in host memory, so say how deep and how much (#971).

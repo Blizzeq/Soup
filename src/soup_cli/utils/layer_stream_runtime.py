@@ -22,7 +22,18 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, FrozenSet, Iterator, Mapping, Optional, Sequence, Tuple, Union
+from typing import (
+    Any,
+    Dict,
+    FrozenSet,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 # Stdlib-only at import (it defers torch to its own constructor), so the
 # default is safe to read at module scope. ``AsyncDiskSource`` itself is
@@ -293,6 +304,86 @@ def quant_sidecar_keys(key: str, spec: Any) -> Tuple[str, ...]:
 # ==========================================================================
 # Tier 1 — the whole frozen base in CPU RAM (plan 5.5)
 # ==========================================================================
+#: torch's caching host allocator hands out page-locked memory in blocks rounded
+#: UP to the next power of two, so pinning the store one tensor at a time costs
+#: far more than its byte count — measured on the dev box (#901): 1.73x on the
+#: Qwen2.5-14B NF4 store (6.82 GB requested, 11.83 GB of private commit), 1.90x
+#: on a run of 35 MB tensors, and a single 9 GB request refused outright because
+#: it rounds to 16 GiB. That rounding, against the box's RAM, is what "could not
+#: page-lock the base" meant on a 32 GB machine. The pinned store is therefore
+#: packed into arenas whose sizes ARE powers of two, every tensor a view.
+PINNED_ARENA_BYTES = 2**28
+#: Every view starts on this boundary: enough for any dtype and for the DMA
+#: engine, and a rounding error of at most 255 bytes per tensor.
+PINNED_ARENA_ALIGN = 256
+
+
+@dataclass(frozen=True)
+class ArenaPlan:
+    """Where each tensor of a pinned store lands, and what the arenas cost."""
+
+    #: Bytes per arena; each is a power of two.
+    arena_sizes: Tuple[int, ...]
+    #: ``(arena, offset)`` per tensor, in the order the sizes were given.
+    placements: Tuple[Tuple[int, int], ...]
+    #: The tensors' own bytes, before any rounding.
+    requested_bytes: int
+
+    @property
+    def pinned_bytes(self) -> int:
+        return sum(self.arena_sizes)
+
+
+def _next_power_of_two(value: int) -> int:
+    return 1 if value <= 1 else 1 << (value - 1).bit_length()
+
+
+def plan_pinned_arenas(
+    sizes: Sequence[int],
+    *,
+    arena_bytes: int = PINNED_ARENA_BYTES,
+    align: int = PINNED_ARENA_ALIGN,
+) -> ArenaPlan:
+    """Pack ``sizes`` (bytes, allocation order) into power-of-two arenas.
+
+    First-fit into the current arena, else open the next; a tensor never
+    straddles two arenas, because it has to be one contiguous view. A tensor
+    larger than ``arena_bytes`` widens every arena to the next power of two
+    above it, so the plan always fits. Each arena is finally trimmed to the
+    power of two above what it holds — the last one is usually part-filled,
+    and a tiny model must not page-lock a whole default arena for a 5 MB store.
+    Pure arithmetic, no torch.
+    """
+    if arena_bytes <= 0 or arena_bytes & (arena_bytes - 1):
+        raise ValueError(f"arena_bytes must be a power of two; got {arena_bytes}")
+    if align <= 0 or align & (align - 1):
+        raise ValueError(f"align must be a power of two; got {align}")
+    if align > arena_bytes:
+        raise ValueError(f"align ({align}) cannot exceed arena_bytes ({arena_bytes})")
+    sizes = [int(size) for size in sizes]
+    if any(size < 0 for size in sizes):
+        raise ValueError(f"a negative tensor size was planned: {min(sizes)}")
+    if not sizes:
+        return ArenaPlan(arena_sizes=(), placements=(), requested_bytes=0)
+    capacity = max(arena_bytes, _next_power_of_two(max(sizes)))
+    fills: List[int] = []
+    placements: List[Tuple[int, int]] = []
+    for size in sizes:
+        if fills:
+            start = -(-fills[-1] // align) * align
+            if start + size <= capacity:
+                placements.append((len(fills) - 1, start))
+                fills[-1] = start + size
+                continue
+        fills.append(size)
+        placements.append((len(fills) - 1, 0))
+    return ArenaPlan(
+        arena_sizes=tuple(max(align, _next_power_of_two(fill)) for fill in fills),
+        placements=tuple(placements),
+        requested_bytes=sum(sizes),
+    )
+
+
 class RamSource:
     """The base held in CPU RAM, allocated ONCE and filled by ``copy_``.
 
@@ -301,6 +392,11 @@ class RamSource:
     not the store — is what pushed a 5.55 GB base past the 7.12 GB page-locked
     ceiling and made a 3B run impossible. So the store is pre-allocated at its
     final dtype and each source tensor is streamed into it one at a time.
+
+    Pinned, the store is a handful of power-of-two arenas with every tensor a
+    view (:func:`plan_pinned_arenas`, #901): ``nbytes`` is still the tensors'
+    own bytes, ``pinned_bytes`` is what is actually page-locked. Pageable, each
+    tensor is its own allocation, as before — the CPU allocator does not round.
     """
 
     def __init__(
@@ -323,38 +419,69 @@ class RamSource:
         self.store: list = []
         self.nbytes = 0
         self.pinned = bool(pin)
+        self.arena_sizes: Tuple[int, ...] = ()
+        self.pinned_bytes = 0
+        plan: Optional[ArenaPlan] = None
+        arenas: List[Any] = []
+        if self.pinned:
+            plan = plan_pinned_arenas(
+                [
+                    math.prod(shape) * _dtype_size(dtype)
+                    for idx in range(n_layers)
+                    for _name, (shape, dtype) in layer_specs[idx].items()
+                ]
+            )
+            for size in plan.arena_sizes:
+                # This is the host store; never inherit a process-wide MPS/CUDA default.
+                arena = torch.empty(size, dtype=torch.uint8, device="cpu", pin_memory=True)
+                self._check_host_tensor(arena)
+                arenas.append(arena)
+            self.arena_sizes = plan.arena_sizes
+            self.pinned_bytes = plan.pinned_bytes
+        self._arenas = arenas
+        position = 0
         for idx in range(n_layers):
             held: Dict[str, Any] = {}
             with safe_open(paths[idx], framework="pt") as handle:
                 for name, (shape, dtype) in layer_specs[idx].items():
-                    # This is the host store; never inherit a process-wide MPS/CUDA default.
-                    dst = torch.empty(
-                        tuple(shape),
-                        dtype=_torch_dtype(dtype),
-                        device="cpu",
-                        pin_memory=self.pinned,
-                    )
-                    # PyTorch 2.7+ on Apple Silicon may return an MPS tensor for
-                    # ``device="cpu", pin_memory=True``.  Accepting that would put
-                    # the entire supposed host store in the accelerator allocator
-                    # while reporting it as pinned CPU RAM (#434).
-                    if dst.device.type != "cpu":
-                        raise RuntimeError(
-                            "layer streaming's RAM source requested a CPU tensor, "
-                            f"but torch returned {dst.device}. Pinned host memory is "
-                            "CUDA-only here; retry with pin=False."
+                    torch_dtype = _torch_dtype(dtype)
+                    if plan is not None:
+                        arena_index, offset = plan.placements[position]
+                        position += 1
+                        length = math.prod(shape) * _dtype_size(dtype)
+                        dst = (
+                            arenas[arena_index][offset : offset + length]
+                            .view(torch_dtype)
+                            .view(tuple(shape))
                         )
-                    if self.pinned and not dst.is_pinned():
-                        raise RuntimeError(
-                            "layer streaming requested pinned CPU RAM, but torch "
-                            "returned pageable memory; retry with pin=False."
+                    else:
+                        dst = torch.empty(
+                            tuple(shape), dtype=torch_dtype, device="cpu", pin_memory=False
                         )
+                        self._check_host_tensor(dst)
                     src = handle.get_tensor(name)
                     dst.copy_(src)
                     del src
                     held[name] = dst
                     self.nbytes += dst.numel() * dst.element_size()
             self.store.append(held)
+
+    def _check_host_tensor(self, tensor: Any) -> None:
+        # PyTorch 2.7+ on Apple Silicon may return an MPS tensor for
+        # ``device="cpu", pin_memory=True``.  Accepting that would put
+        # the entire supposed host store in the accelerator allocator
+        # while reporting it as pinned CPU RAM (#434).
+        if tensor.device.type != "cpu":
+            raise RuntimeError(
+                "layer streaming's RAM source requested a CPU tensor, "
+                f"but torch returned {tensor.device}. Pinned host memory is "
+                "CUDA-only here; retry with pin=False."
+            )
+        if self.pinned and not tensor.is_pinned():
+            raise RuntimeError(
+                "layer streaming requested pinned CPU RAM, but torch "
+                "returned pageable memory; retry with pin=False."
+            )
 
     @staticmethod
     def spec_from_shard(shard_dir: str, idx: int = 0) -> Dict[str, Tuple[Tuple[int, ...], str]]:
@@ -1445,6 +1572,22 @@ def measure_step_peak_bytes(
             oom=True,
         )
     except Exception as exc:  # pragma: no cover - a real CUDA op raised
+        if _is_out_of_memory(exc):
+            # #649's shape, seen in #901: under WDDM the allocator has often
+            # already spilled, so the out-of-memory surfaces later, at a
+            # synchronise, as `AcceleratorError("CUDA error: out of memory")`
+            # rather than as the allocator's own exception. Same verdict — the
+            # shape does not fit — and the verdict is what tells the operator
+            # to lower batch or max_length, where "instrument failure" tells
+            # them nothing they can act on.
+            return StepPeak(
+                peak_bytes=0,
+                reserved_bytes=0,
+                seconds=time.perf_counter() - started,
+                rows=rows,
+                seq_len=seq_len,
+                oom=True,
+            )
         # NOT `return None`. None means "never attempted"; this op ran and broke,
         # which can leave the CUDA context poisoned (an illegal access or device
         # assert surfaces exactly here). Reporting that as "cannot tell" would
@@ -1920,6 +2063,11 @@ class StreamRuntime:
             "large_buffer_bytes": getattr(self.large_pool, "nbytes", 0),
             "store_bytes": self.source.nbytes,
             "pinned": self.pinned,
+            # What is actually page-locked for the store (#901): the arenas'
+            # power-of-two sizes on a pinned RamSource, 0 on a pageable one, and
+            # None for a source that does not account for it (the disk tier's
+            # staging still pins per tensor).
+            "pinned_bytes": getattr(self.source, "pinned_bytes", None) if self.pinned else 0,
             "tier": self.tier,
             # The reader's depth, where there is a reader. None on the RAM
             # tier — RamSource holds every layer and reads nothing ahead, so a
