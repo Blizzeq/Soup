@@ -1831,3 +1831,131 @@ class TestTheReaderSurvivesDyingInBootstrap:
             assert len(killed) == getattr(mod, "_MAX_READER_STARTS", -1), killed
         finally:
             source.close()
+
+
+class TestTheRangeWorkersSurviveDyingInBootstrap:
+    """#1056, the same race one level down: the ``_RangeReaders`` workers the
+    reader hands byte ranges to are threads too. With every worker dead in
+    bootstrap, ``run`` saw no live worker and reported "layer-stream disk
+    source is closed" for a source nobody had closed."""
+
+    @staticmethod
+    def _kill_workers(monkeypatch, prefix, times):
+        killed = []
+
+        def killer(frame, event, arg):
+            if (
+                len(killed) < times
+                and frame.f_code.co_name == "run"
+                and threading.current_thread().name.startswith(prefix)
+            ):
+                killed.append(threading.current_thread().name)
+                raise RuntimeError("injected: range worker died before its target ran")
+            return None
+
+        monkeypatch.setattr(threading, "_trace_hook", killer)
+        monkeypatch.setattr(threading, "excepthook", lambda args: None)
+        return killed
+
+    def test_one_dead_worker_leaves_the_others_serving(self, tmp_path, monkeypatch):
+        killed = self._kill_workers(monkeypatch, "soup-layer-range-0", times=1)
+        shard_dir = _shards(tmp_path)
+        spec = _spec(shard_dir)
+        shipped = DiskSource(shard_dir, N_LAYERS, spec)
+        ours = AsyncDiskSource(
+            shard_dir, N_LAYERS, spec, read_ahead=2, pin=False, read_ranges=2
+        )
+        try:
+            first_name = next(iter(spec[0]))
+            captured = _get_on_a_thread(ours, 0, first_name)
+            assert killed == ["soup-layer-range-0"], killed
+            assert "exc" not in captured, repr(captured["exc"])
+            for idx in range(N_LAYERS):
+                for name in spec[idx]:
+                    theirs = shipped.get(idx, name)
+                    mine = ours.get(idx, name)
+                    assert mine.dtype == theirs.dtype, (idx, name)
+                    assert mine.shape == theirs.shape, (idx, name)
+                    assert torch.equal(_raw_bytes(mine), _raw_bytes(theirs)), (idx, name)
+        finally:
+            ours.close()
+            shipped.close()
+
+    def test_every_worker_dead_is_a_start_failure_not_closed(
+        self, tmp_path, monkeypatch
+    ):
+        import soup_cli.utils.async_disk_source as mod
+
+        killed = self._kill_workers(monkeypatch, "soup-layer-range-", times=10**6)
+        shard_dir = _shards(tmp_path)
+        source = AsyncDiskSource(
+            shard_dir, N_LAYERS, _spec(shard_dir), pin=False, read_ranges=1
+        )
+        try:
+            captured = _get_on_a_thread(
+                source, 0, "input_layernorm.weight", timeout=15.0
+            )
+            exc = captured.get("exc")
+            assert isinstance(exc, RuntimeError), repr(captured)
+            message = str(exc)
+            assert "failed to start" in message, message
+            assert "closed" not in message, message
+            assert len(killed) == getattr(mod, "_MAX_READER_STARTS", -1), killed
+        finally:
+            source.close()
+
+    @staticmethod
+    def _run_pool(pool, timeout=15.0):
+        """``pool.run`` on a thread with a deadline, so a regression that polls
+        forever FAILS here instead of hanging the suite."""
+        captured = {}
+
+        def call():
+            try:
+                pool.run([lambda: None])
+                captured["value"] = "ran"
+            except BaseException as exc:  # noqa: BLE001 — recorded for the assert
+                captured["exc"] = exc
+
+        helper = threading.Thread(target=call, daemon=True)
+        helper.start()
+        helper.join(timeout=timeout)
+        assert not helper.is_alive(), "pool.run never returned"
+        return captured
+
+    def test_a_closed_pool_still_says_closed(self, monkeypatch):
+        """Genuine close semantics are untouched, including when a worker had
+        also died in bootstrap: a pool the owner closed is closed."""
+        from soup_cli.utils.async_disk_source import _RangeReaders
+
+        pool = _RangeReaders(2)
+        pool.close()
+        captured = self._run_pool(pool)
+        assert str(captured.get("exc")) == "layer-stream disk source is closed", captured
+
+        killed = self._kill_workers(monkeypatch, "soup-layer-range-", times=10**6)
+        dead = _RangeReaders(1)
+        try:
+            dead._threads[0].join(timeout=5.0)
+            assert killed, "the injection never fired, so this proves nothing"
+        finally:
+            dead.close()
+        captured = self._run_pool(dead)
+        assert str(captured.get("exc")) == "layer-stream disk source is closed", captured
+
+    def test_a_worker_that_ran_and_left_is_not_restarted(self, monkeypatch):
+        """The restart is for a worker that never ran. One that entered and
+        exited without a sentinel may have taken a job, so it is refused, not
+        restarted — and not reported as closed, because nobody closed it."""
+        from soup_cli.utils.async_disk_source import _RangeReaders
+
+        monkeypatch.setattr(_RangeReaders, "_loop", lambda self: None)
+        pool = _RangeReaders(1)
+        try:
+            pool._threads[0].join(timeout=5.0)
+            captured = self._run_pool(pool)
+            message = str(captured.get("exc"))
+            assert "exited without the source being closed" in message, captured
+            assert pool._starts == [1], pool._starts
+        finally:
+            pool.close()
