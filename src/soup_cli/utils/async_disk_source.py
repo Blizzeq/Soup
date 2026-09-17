@@ -105,6 +105,17 @@ _MAX_SPEC_GROUPS = 8
 # consumer parked on a 40 s cold read wakes ~80 times to look at two fields.
 _LIVENESS_POLL_SECONDS = 0.5
 
+# How many times the reader thread is STARTED before a start failure is final.
+#
+# On CPython <= 3.11 a thread that starts while another thread is inside
+# `sys.settrace` dies in `Thread._bootstrap_inner` ("Cannot install a trace
+# function while another trace function is being installed") before its target
+# runs — a tracer's `threading.settrace` hook plus any audit hook is enough
+# (#1056; #1030 is the same race in the test helper). That reader did no work,
+# so starting another is exact rather than a retry. Bounded, because a thread
+# that can NEVER start must still end in an error instead of a restart loop.
+_MAX_READER_STARTS = 3
+
 
 def _spec_key(layer_spec: Mapping[str, Tuple[Tuple[int, ...], str]]) -> tuple:
     """A hashable identity for one layer's tensor names, shapes and dtypes.
@@ -485,10 +496,26 @@ class AsyncDiskSource:
         self._direction: Dict[int, int] = {}
         self._error: Optional[BaseException] = None
         self._closed = False
+        # Set by the reader as its first statement and never cleared: the
+        # liveness check needs to tell a reader that ran and left from one that
+        # died before running, and only the second may be restarted.
+        self._reader_entered = threading.Event()
+        self._reader_starts = 0
+        self._start_reader()
+
+    def _start_reader(self) -> None:
+        """Start a reader thread. Lock held, or no other thread exists yet."""
         self._thread = threading.Thread(
-            target=self._run, name="soup-layer-reader", daemon=True
+            target=self._enter_and_run, name="soup-layer-reader", daemon=True
         )
+        self._reader_starts += 1
         self._thread.start()
+
+    def _enter_and_run(self) -> None:
+        # A wrapper rather than a line in `_run`, so a replaced `_run` (the
+        # backstop tests) still counts as a reader that entered.
+        self._reader_entered.set()
+        self._run()
 
     # -- staging ---------------------------------------------------------
     def _allocate_staging(self, region_sizes: Sequence[int]) -> Tuple[List[Any], List[Any]]:
@@ -976,8 +1003,30 @@ class AsyncDiskSource:
           time the consumer spends unable to proceed, and charging the wider
           window errs towards firing, which is the safe direction for a
           hang detector carrying a 15x margin.
+
+        A reader that is gone WITHOUT having entered is neither: it died in
+        thread bootstrap before ``_run`` began (#1056), so it holds no request,
+        no slot and no in-flight read, and starting a fresh one is exact. That
+        is bounded by ``_MAX_READER_STARTS`` and ends in its own error, so a
+        thread that can never start is still refused rather than looped on.
         """
         if self._error is None and not self._closed and not self._thread.is_alive():
+            if not self._reader_entered.is_set():
+                if self._reader_starts < _MAX_READER_STARTS:
+                    logger.warning(
+                        "layer-stream reader thread died before it started "
+                        "(start %d of %d); starting another",
+                        self._reader_starts,
+                        _MAX_READER_STARTS,
+                    )
+                    self._start_reader()
+                    return
+                raise RuntimeError(
+                    f"layer-stream reader thread failed to start {self._reader_starts} "
+                    f"times, with layer {idx} still wanted: each died before running "
+                    f"(on CPython <= 3.11 a tracer's threading.settrace hook can kill "
+                    f"a starting thread). Refusing rather than blocking."
+                )
             raise RuntimeError(
                 f"layer-stream reader thread exited without recording an error, "
                 f"with layer {idx} still wanted. Refusing rather than blocking: a "

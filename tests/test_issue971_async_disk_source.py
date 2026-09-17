@@ -1731,3 +1731,103 @@ class TestTheHelperDoesNotBlameTheDetectorForAThreadThatNeverRan:
                 _get_on_a_thread(_Hangs(), 0, "w", timeout=0.3)
         finally:
             gate.set()
+
+
+class TestTheReaderSurvivesDyingInBootstrap:
+    """#1056: the source's OWN reader thread hits the race #1030 fixed for the
+    test helper. On CPython <= 3.11 it can die in ``Thread._bootstrap_inner``
+    before ``_run`` executes, and the "exited without recording an error"
+    backstop then refused a run whose reader never ran. Injected
+    deterministically the way #1030 does it: a ``threading._trace_hook`` that
+    raises on the reader's first frame — targeted by thread NAME, because the
+    range workers and the ``_get_on_a_thread`` helper start threads too."""
+
+    @staticmethod
+    def _kill_the_reader(monkeypatch, times):
+        killed = []
+
+        def killer(frame, event, arg):
+            if (
+                len(killed) < times
+                and frame.f_code.co_name == "run"
+                and threading.current_thread().name == "soup-layer-reader"
+            ):
+                killed.append(threading.current_thread().ident)
+                raise RuntimeError("injected: reader died before its target ran")
+            return None
+
+        monkeypatch.setattr(threading, "_trace_hook", killer)
+        monkeypatch.setattr(threading, "excepthook", lambda args: None)
+        return killed
+
+    def test_a_reader_that_died_in_bootstrap_is_restarted_and_serves(
+        self, tmp_path, monkeypatch
+    ):
+        killed = self._kill_the_reader(monkeypatch, times=1)
+        shard_dir = _shards(tmp_path)
+        spec = _spec(shard_dir)
+        shipped = DiskSource(shard_dir, N_LAYERS, spec)
+        ours = AsyncDiskSource(shard_dir, N_LAYERS, spec, read_ahead=2, pin=False)
+        try:
+            first_name = next(iter(spec[0]))
+            captured = _get_on_a_thread(ours, 0, first_name)
+            assert killed, "the injection never fired, so this proves nothing"
+            assert "exc" not in captured, repr(captured["exc"])
+            assert torch.equal(
+                _raw_bytes(captured["value"]), _raw_bytes(shipped.get(0, first_name))
+            )
+            for idx in range(N_LAYERS):
+                for name in spec[idx]:
+                    theirs = shipped.get(idx, name)
+                    mine = ours.get(idx, name)
+                    assert mine.dtype == theirs.dtype, (idx, name)
+                    assert mine.shape == theirs.shape, (idx, name)
+                    assert torch.equal(_raw_bytes(mine), _raw_bytes(theirs)), (idx, name)
+            assert len(killed) == 1, killed
+        finally:
+            ours.close()
+            shipped.close()
+        assert not ours._thread.is_alive(), "close() must stop the restarted reader"
+
+    def test_a_reader_that_entered_and_exited_keeps_the_existing_message(
+        self, tmp_path, monkeypatch
+    ):
+        """The restart is for a reader that never ran. One that ran and then
+        left without ``_fail`` is the backstop's case, word for word."""
+        monkeypatch.setattr(AsyncDiskSource, "_run", lambda self: None)
+        shard_dir = _shards(tmp_path)
+        source = AsyncDiskSource(shard_dir, N_LAYERS, _spec(shard_dir), pin=False)
+        try:
+            captured = _get_on_a_thread(source, 0, "input_layernorm.weight")
+            exc = captured.get("exc")
+            assert isinstance(exc, RuntimeError), repr(captured)
+            assert str(exc) == (
+                "layer-stream reader thread exited without recording an error, "
+                "with layer 0 still wanted. Refusing rather than blocking: a "
+                "training run that stops without an error is worse than one that "
+                "fails."
+            )
+        finally:
+            source.close()
+
+    def test_a_reader_that_never_starts_is_refused_after_bounded_restarts(
+        self, tmp_path, monkeypatch
+    ):
+        import soup_cli.utils.async_disk_source as mod
+
+        monkeypatch.setattr(mod, "_LIVENESS_POLL_SECONDS", 0.05)
+        killed = self._kill_the_reader(monkeypatch, times=10**6)
+        shard_dir = _shards(tmp_path)
+        source = AsyncDiskSource(shard_dir, N_LAYERS, _spec(shard_dir), pin=False)
+        try:
+            captured = _get_on_a_thread(
+                source, 0, "input_layernorm.weight", timeout=10.0
+            )
+            exc = captured.get("exc")
+            assert isinstance(exc, RuntimeError), repr(captured)
+            message = str(exc)
+            assert "failed to start" in message, message
+            assert "exited without recording an error" not in message, message
+            assert len(killed) == getattr(mod, "_MAX_READER_STARTS", -1), killed
+        finally:
+            source.close()
