@@ -127,5 +127,14 @@ class TestTheGate:
         del metadata["chat_template"]
         metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
 
-        with pytest.raises(ValueError, match="re-run `soup data preprocess`"):
+        with pytest.raises(ValueError, match="re-run `soup data preprocess`") as exc:
             _gate(tmp_path, cache_dir)
+        assert "predates chat_template keying" in str(exc.value)
+
+    def test_a_current_cache_mismatch_does_not_claim_to_predate(
+        self, tmp_path, monkeypatch
+    ):
+        cache_dir = _preprocess(tmp_path, monkeypatch, _OVERRIDE)
+        with pytest.raises(ValueError, match="cache hash mismatch") as exc:
+            _gate(tmp_path, cache_dir)
+        assert "predates" not in str(exc.value)

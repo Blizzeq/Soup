@@ -507,10 +507,16 @@ def _maybe_load_pretokenized(
             chat_template=resolve_chat_template(dcfg.chat_template),
         )
         if stored_key != current_key:
+            # A cache without the field was written before #1067 keyed on the template.
+            predates = (
+                "the cache predates chat_template keying (#1067); "
+                if "chat_template" not in metadata
+                else ""
+            )
             raise ValueError(
                 "pre_tokenized cache hash mismatch: was generated with "
                 f"{stored_key!r}, current config implies {current_key!r}; "
-                "re-run `soup data preprocess`"
+                f"{predates}re-run `soup data preprocess`"
             )
     else:
         console_obj.print(
