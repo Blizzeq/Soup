@@ -11,6 +11,7 @@ from typing import Optional
 
 import typer
 from rich.console import Console
+from rich.markup import escape as markup_escape
 from rich.table import Table
 
 from soup_cli.data.loader import load_raw_data
@@ -2406,7 +2407,11 @@ def preprocess_dataset(
 
     dataset_path = _cache_key_dataset_path(cfg)
     # #1067: render with data.chat_template, as the live path does, and key on it.
-    chat_template = resolve_chat_template(cfg.data.chat_template)
+    try:
+        chat_template = resolve_chat_template(cfg.data.chat_template)
+    except KeyError as exc:
+        console.print(f"[red]Invalid data.chat_template:[/] {markup_escape(exc.args[0])}")
+        raise typer.Exit(1) from exc
     train_display = (
         ", ".join(cfg.data.train) if isinstance(cfg.data.train, list) else cfg.data.train
     )

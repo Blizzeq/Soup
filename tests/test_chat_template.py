@@ -277,3 +277,48 @@ class TestHardError:
         assert out["input_ids"] == [1, 2, 3]  # override made the legacy path usable
         assert tok.applied  # apply_chat_template was invoked
         assert tok.chat_template is not None  # override was applied
+
+
+# ---------------------------------------------------------------------------
+# An unregistered name exits with a message, not a KeyError traceback
+# ---------------------------------------------------------------------------
+
+
+_UNREGISTERED_CONFIG = (
+    "base: some-org/some-model\ntask: sft\ndata:\n  train: d.jsonl\n"
+    "  format: chatml\n  chat_template: not_a_real_name\n  max_length: 128\n"
+)
+
+
+class TestUnregisteredNameExitsCleanly:
+    def _invoke(self, tmp_path, monkeypatch, args):
+        transformers = pytest.importorskip("transformers")
+        from typer.testing import CliRunner
+
+        from soup_cli.cli import app
+
+        def _no_download(*_args, **_kwargs):
+            raise AssertionError("nothing should load for an invalid config")
+
+        for name in ("AutoTokenizer", "AutoModelForCausalLM"):
+            monkeypatch.setattr(
+                getattr(transformers, name), "from_pretrained", _no_download
+            )
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "d.jsonl").write_text("{}\n", encoding="utf-8")
+        (tmp_path / "soup.yaml").write_text(_UNREGISTERED_CONFIG, encoding="utf-8")
+        return CliRunner().invoke(app, args)
+
+    @pytest.mark.parametrize(
+        "args",
+        [["data", "preprocess", "soup.yaml", "--yes"], ["train", "--config", "soup.yaml"]],
+        ids=["preprocess", "train"],
+    )
+    def test_exits_1_naming_the_template(self, tmp_path, monkeypatch, args):
+        result = self._invoke(tmp_path, monkeypatch, args)
+
+        assert result.exit_code == 1, result.output
+        assert isinstance(result.exception, SystemExit), result.exception
+        assert "Invalid data.chat_template" in result.output
+        assert "not_a_real_name" in result.output
+        assert "chatml" in result.output, "the message still lists the known names"
