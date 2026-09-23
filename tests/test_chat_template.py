@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import pytest
 
+from tests.conftest import strip_ansi
+
 # ---------------------------------------------------------------------------
 # Schema field
 # ---------------------------------------------------------------------------
@@ -284,14 +286,23 @@ class TestHardError:
 # ---------------------------------------------------------------------------
 
 
-_UNREGISTERED_CONFIG = (
+_CONFIG_TEMPLATE = (
     "base: some-org/some-model\ntask: sft\ndata:\n  train: d.jsonl\n"
-    "  format: chatml\n  chat_template: not_a_real_name\n  max_length: 128\n"
+    "  format: chatml\n  chat_template: {name}\n  max_length: 128\n"
+)
+_UNREGISTERED_CONFIG = _CONFIG_TEMPLATE.format(name="not_a_real_name")
+# A double-quoted YAML string can carry ESC and BEL: clear-screen plus a window title.
+_CONTROL_BYTES_CONFIG = _CONFIG_TEMPLATE.format(name='"bad\\e[2J\\e]0;PWNED\\aname"')
+
+_COMMANDS = pytest.mark.parametrize(
+    "args",
+    [["data", "preprocess", "soup.yaml", "--yes"], ["train", "--config", "soup.yaml"]],
+    ids=["preprocess", "train"],
 )
 
 
 class TestUnregisteredNameExitsCleanly:
-    def _invoke(self, tmp_path, monkeypatch, args):
+    def _invoke(self, tmp_path, monkeypatch, args, config=_UNREGISTERED_CONFIG):
         transformers = pytest.importorskip("transformers")
         from typer.testing import CliRunner
 
@@ -306,19 +317,25 @@ class TestUnregisteredNameExitsCleanly:
             )
         monkeypatch.chdir(tmp_path)
         (tmp_path / "d.jsonl").write_text("{}\n", encoding="utf-8")
-        (tmp_path / "soup.yaml").write_text(_UNREGISTERED_CONFIG, encoding="utf-8")
+        (tmp_path / "soup.yaml").write_text(config, encoding="utf-8")
         return CliRunner().invoke(app, args)
 
-    @pytest.mark.parametrize(
-        "args",
-        [["data", "preprocess", "soup.yaml", "--yes"], ["train", "--config", "soup.yaml"]],
-        ids=["preprocess", "train"],
-    )
+    @_COMMANDS
     def test_exits_1_naming_the_template(self, tmp_path, monkeypatch, args):
         result = self._invoke(tmp_path, monkeypatch, args)
+        output = strip_ansi(result.output)
 
         assert result.exit_code == 1, result.output
         assert isinstance(result.exception, SystemExit), result.exception
-        assert "Invalid data.chat_template" in result.output
-        assert "not_a_real_name" in result.output
-        assert "chatml" in result.output, "the message still lists the known names"
+        assert "Invalid data.chat_template" in output
+        assert "not_a_real_name" in output
+        assert "chatml" in output, "the message still lists the known names"
+
+    @_COMMANDS
+    def test_control_bytes_in_the_name_do_not_reach_the_terminal(self, tmp_path, monkeypatch, args):
+        result = self._invoke(tmp_path, monkeypatch, args, config=_CONTROL_BYTES_CONFIG)
+        # strip_ansi removes only Rich's own SGR colour codes, not the injected sequences.
+        output = strip_ansi(result.output)
+
+        assert result.exit_code == 1, result.output
+        assert "\x1b" not in output and "\x07" not in output, repr(output)
