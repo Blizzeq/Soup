@@ -293,6 +293,8 @@ _CONFIG_TEMPLATE = (
 _UNREGISTERED_CONFIG = _CONFIG_TEMPLATE.format(name="not_a_real_name")
 # A double-quoted YAML string can carry ESC and BEL: clear-screen plus a window title.
 _CONTROL_BYTES_CONFIG = _CONFIG_TEMPLATE.format(name='"bad\\e[2J\\e]0;PWNED\\aname"')
+# Rich markup in the name: an unbalanced closing tag would raise MarkupError.
+_MARKUP_CONFIG = _CONFIG_TEMPLATE.format(name="'x[/]'")
 
 _COMMANDS = pytest.mark.parametrize(
     "args",
@@ -338,4 +340,14 @@ class TestUnregisteredNameExitsCleanly:
         output = strip_ansi(result.output)
 
         assert result.exit_code == 1, result.output
+        assert "Invalid data.chat_template" in output, repr(output)
         assert "\x1b" not in output and "\x07" not in output, repr(output)
+
+    @_COMMANDS
+    def test_markup_in_the_name_is_printed_literally(self, tmp_path, monkeypatch, args):
+        result = self._invoke(tmp_path, monkeypatch, args, config=_MARKUP_CONFIG)
+        output = strip_ansi(result.output)
+
+        assert result.exit_code == 1, result.output
+        assert isinstance(result.exception, SystemExit), result.exception
+        assert "'x[/]'" in output, repr(output)
