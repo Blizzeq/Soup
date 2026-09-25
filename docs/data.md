@@ -1101,6 +1101,13 @@ loaders choose rows and their order. Every other `data` field is listed in
 new field must be added to one of the two tables. Caches written before this
 (tokenizer schema `v6` and earlier) are refused; re-run `soup data preprocess`.
 
+The `pre_tokenized` training config must keep `data.val_split`, `data.replay`,
+`data.replay_ratio`, `data.replay_seed`, `data.streaming`, `data.buffer_size`,
+`data.image_dir` and `data.audio_dir` as they were when the cache was built, as it
+must keep the chat template. A cache built under different values is refused, and
+the message names the fields that changed. A cache written before this keying
+says so instead of showing two bare hashes.
+
 
 ## Data Recipe DAG Runner (`soup data recipe --execute`)
 
