@@ -1081,7 +1081,7 @@ dataset without `labels` trains on every token, because TRL's collator copies
 `input_ids` into `labels`. That is the pretraining objective, and a
 `soup data preprocess` cache built for `task: pretrain` records the same labels.
 
-The full key, as `PREPROCESS_KEY_FIELDS` in `soup_cli/utils/data_pipeline.py`
+The full key, as `PREPROCESS_KEY_FIELDS` in `src/soup_cli/utils/data_pipeline.py`
 declares it:
 
 | Key input | Config fields |

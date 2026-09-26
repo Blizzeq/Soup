@@ -111,11 +111,11 @@ class TestDatasetKeyDiff:
         current = dp.preprocess_dataset_key_input(DataConfig(train="./d.jsonl"))
         assert dp.preprocess_dataset_key_diff(json.loads(current), current) == []
 
-    def test_a_stored_value_that_is_not_a_dict_differs_everywhere(self):
+    @pytest.mark.parametrize("stored", ["edited", None])
+    def test_a_stored_value_that_is_not_a_dict_names_nothing(self, stored):
+        """A hand-edited ``dataset_key`` cannot say what changed, so no field is named."""
         current = dp.preprocess_dataset_key_input(DataConfig(train="./d.jsonl"))
-        assert dp.preprocess_dataset_key_diff("edited", current) == list(
-            dp._DATASET_KEY_FIELDS
-        )
+        assert dp.preprocess_dataset_key_diff(stored, current) == []
 
 
 class TestTheGateNeedsATask:
@@ -150,3 +150,35 @@ class TestExclusionReasonsDescribeTheCode:
 
     def test_remove_unused_columns_says_no_trainer_reads_it(self):
         assert "no trainer reads it" in dp.NOT_PREPROCESS_KEY_FIELDS["remove_unused_columns"]
+
+    def test_remove_unused_columns_is_still_unconsumed(self):
+        from tests.test_issue748_config_fields_reach_a_consumer import KNOWN_UNCONSUMED
+
+        assert "data.remove_unused_columns" in KNOWN_UNCONSUMED
+
+
+class TestTheOldestGapStillWins:
+    @pytest.mark.parametrize(
+        ("dropped", "expected"),
+        [
+            (("mask_mode",), "predates loss-mask keying (#1054)"),
+            (("mask_mode", "chat_template"), "predates chat_template keying (#1067)"),
+        ],
+    )
+    def test_an_older_cache_names_its_own_gap(
+        self, tmp_path, monkeypatch, dropped, expected
+    ):
+        """A real v5 or v4 cache has no ``key_schema`` or ``dataset_key`` either,
+        so it predates #1127 too; the oldest gap is the one named."""
+        cache_dir = _cache(tmp_path, monkeypatch)
+        meta_path = cache_dir / "metadata.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        for field in ("key_schema", "dataset_key", *dropped):
+            meta.pop(field)
+        meta["cache_key"] = "0" * 16
+        meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+        message = _refusal(cache_dir, tmp_path)
+
+        assert expected in message
+        assert "#1127" not in message

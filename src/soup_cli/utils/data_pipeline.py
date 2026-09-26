@@ -320,12 +320,12 @@ def preprocess_dataset_key_diff(stored: Any, current: str) -> List[str]:
     dict); ``current`` is ``preprocess_dataset_key_input``'s JSON for the config
     being trained. Returns the differing field names in table order, so a refused
     cache can name what changed rather than leave two hashes to compare. A
-    ``stored`` value that is not a dict (a hand-edited file) differs in every
-    field.
+    ``stored`` value that is not a dict (a hand-edited file) names no field
+    rather than claim differences it cannot see.
     """
     now = json.loads(current)
     if not isinstance(stored, dict):
-        return list(_DATASET_KEY_FIELDS)
+        return []
     return [name for name in _DATASET_KEY_FIELDS if stored.get(name) != now.get(name)]
 
 
